@@ -11,6 +11,9 @@
 #define SDB_KEY_BB "bb.0x%"PFMT64x ".0x%"PFMT64x
 // XXX must be configurable by the user
 #define FCN_DEPTH 512
+#define JMPTBLSZ 512
+#define JMPTBL_LEA_SEARCH_SZ 64
+#define JMPTBL_MAXFCNSIZE 4096
 
 /* speedup analysis by removing some function overlapping checks */
 #define JAYRO_04 0
@@ -28,14 +31,21 @@
 // 256KB max function size
 #define MAX_FCN_SIZE (1024 * 256)
 
-#define MAX_JMPTBL_SIZE 1000
-#define MAX_JMPTBL_JMP 10000
-
 #define DB a->sdb_fcns
 #define EXISTS(x, ...) snprintf (key, sizeof (key) - 1, x, ## __VA_ARGS__), sdb_exists (DB, key)
 #define SETKEY(x, ...) snprintf (key, sizeof (key) - 1, x, ## __VA_ARGS__);
 
 #define VERBOSE_DELAY if (0)
+
+#define FCN_CONTAINER(x) container_of ((RBNode*)x, RAnalFunction, rb)
+#define fcn_tree_foreach_intersect(root, it, data, from, to)										\
+	for (it = _fcn_tree_iter_first (root, from, to); it.cur && (data = FCN_CONTAINER (it.cur), 1); _fcn_tree_iter_next (&(it), from, to))
+
+typedef struct fcn_tree_iter_t {
+	int len;
+	RBNode *cur;
+	RBNode *path[R_RBTREE_MAX_HEIGHT];
+} FcnTreeIter;
 
 #if USE_SDB_CACHE
 static Sdb *HB = NULL;
@@ -69,14 +79,186 @@ R_API void r_anal_fcn_update_tinyrange_bbs(RAnalFunction *fcn) {
 	}
 }
 
-R_API int r_anal_fcn_resize(RAnalFunction *fcn, int newsize) {
+// _fcn_tree_{cmp_addr,calc_max_addr,free,probe} are used by interval tree.
+static int _fcn_tree_cmp_addr(const void *a_, const RBNode *b_) {
+	const RAnalFunction *a = (const RAnalFunction *)a_;
+	const RAnalFunction *b = FCN_CONTAINER (b_);
+	ut64 from0 = a->addr, to0 = a->addr + a->_size,
+		from1 = b->addr, to1 = b->addr + b->_size;
+	if (from0 != from1) {
+		return from0 < from1 ? -1 : 1;
+	}
+	if (to0 != to1) {
+		return to0 - 1 < to1 - 1 ? -1 : 1;
+	}
+	return 0;
+}
+
+static void _fcn_tree_calc_max_addr(RBNode *node) {
+	int i;
+	RAnalFunction *fcn = FCN_CONTAINER (node);
+	fcn->rb_max_addr = fcn->addr + (fcn->_size == 0 ? 0 : fcn->_size - 1);
+	for (i = 0; i < 2; i++) {
+		if (node->child[i]) {
+			RAnalFunction *fcn1 = FCN_CONTAINER (node->child[i]);
+			if (fcn1->rb_max_addr > fcn->rb_max_addr) {
+				fcn->rb_max_addr = fcn1->rb_max_addr;
+			}
+		}
+	}
+}
+
+static void _fcn_tree_free(RBNode *node) {
+	// TODO RB tree is an intrusive data structure by embedding RBNode into RAnalFunction.
+	// Currently fcns takes the ownership of the resources.
+	// If the ownership transfers from fcns to fcn_tree:
+	//
+	// r_anal_fcn_free (FCN_CONTAINER (node));
+}
+
+// Descent x_ to find the first node whose interval intersects [from, to)
+static RBNode *_fcn_tree_probe(FcnTreeIter *it, RBNode *x_, ut64 from, ut64 to) {
+	RAnalFunction *x = FCN_CONTAINER (x_), *y;
+	RBNode *y_;
+	for (;;) {
+		if ((y_ = x_->child[0]) && (y = FCN_CONTAINER (y_), from <= y->rb_max_addr)) {
+			it->path[it->len++] = x_;
+			x_ = y_;
+			x = y;
+			continue;
+		}
+		if (x->addr <= to - 1) {
+			if (from <= x->addr + (x->_size == 0 ? 0 : x->_size - 1)) {
+				return x_;
+			}
+			if ((y_ = x_->child[1])) {
+				x_ = y_;
+				x = FCN_CONTAINER (y_);
+				if (from <= x->rb_max_addr) {
+					continue;
+				}
+			}
+		}
+		return NULL;
+	}
+}
+
+R_API bool r_anal_fcn_tree_delete(RBNode **root, RAnalFunction *data) {
+	return r_rbtree_aug_delete (root, data, _fcn_tree_cmp_addr, _fcn_tree_free, _fcn_tree_calc_max_addr);
+}
+
+R_API void r_anal_fcn_tree_insert(RBNode **root, RAnalFunction *fcn) {
+	r_rbtree_aug_insert (root, fcn, &(fcn->rb), _fcn_tree_cmp_addr, _fcn_tree_calc_max_addr);
+}
+
+static void _fcn_tree_update_size(RBNode *root, RAnalFunction *fcn) {
+	r_rbtree_aug_update_sum (root, fcn, &(fcn->rb), _fcn_tree_cmp_addr, _fcn_tree_calc_max_addr);
+}
+
+#if 0
+static void _fcn_tree_print_dot_node(RBNode *n) {
+	int i;
+	RAnalFunction *fcn = FCN_CONTAINER (n);
+
+	ut64 max_addr = fcn->addr + (fcn->_size == 0 ? 0 : fcn->_size - 1);
+	for (i = 0; i < 2; i++) {
+		if (n->child[i]) {
+			RAnalFunction *fcn1 = FCN_CONTAINER (n->child[i]);
+			if (fcn1->rb_max_addr > max_addr) {
+				max_addr = fcn1->rb_max_addr;
+			}
+		}
+	}
+
+	bool valid = max_addr == fcn->rb_max_addr;
+
+	r_cons_printf ("  \"%p\" [label=\"%p\\naddr: 0x%08"PFMT64x"\\nmax_addr: 0x%08"PFMT64x"\"%s];\n",
+				   n, fcn, fcn->addr, fcn->rb_max_addr, valid ? "" : ", color=\"red\", fillcolor=\"white\"");
+
+	for (i=0; i<2; i++) {
+		if (n->child[i]) {
+			_fcn_tree_print_dot_node (n->child[i]);
+			bool valid = true;
+			if (n->child[i]) {
+				RAnalFunction *childfcn = FCN_CONTAINER (n->child[i]);
+				if ((i == 0 && childfcn->addr >= fcn->addr) || (i == 1 && childfcn->addr <= fcn->addr)) {
+					valid = false;
+				}
+			}
+			r_cons_printf ("  \"%p\" -> \"%p\" [label=\"%d\"%s];\n", n, n->child[i], i, valid ? "" : ", style=\"bold\", color=\"red\"");
+		} else {
+			r_cons_printf ("  \"null_%p_%d\" [shape=point];\n", n, i);
+			r_cons_printf ("  \"%p\" -> \"null_%p_%d\" [label=\"%d\"];\n", n, n, i, i);
+		}
+	}
+}
+
+static void _fcn_tree_print_dot(RBNode *n) {
+	r_cons_print ("digraph fcn_tree {\n");
+	if (n) {
+		_fcn_tree_print_dot_node (n);
+	}
+	r_cons_print ("}\n");
+}
+#endif
+
+// Find RAnalFunction whose addr is equal to addr
+static RAnalFunction *_fcn_tree_find_addr(RBNode *x_, ut64 addr) {
+	while (x_) {
+		RAnalFunction *x = FCN_CONTAINER (x_);
+		if (x->addr == addr) {
+			return x;
+		}
+		x_ = x_->child[x->addr < addr];
+	}
+	return NULL;
+}
+
+// _fcn_tree_{iter_first,iter_next} are used to iterate functions whose intervals intersect [from, to) in O(log(n) + |candidates|) time
+static FcnTreeIter _fcn_tree_iter_first(RBNode *x_, ut64 from, ut64 to) {
+	FcnTreeIter it = {0};
+	it.len = 0;
+	if (x_ && from <= FCN_CONTAINER (x_)->rb_max_addr) {
+		it.cur = _fcn_tree_probe (&it, x_, from, to);
+	} else {
+		it.cur = NULL;
+	}
+	return it;
+}
+
+static void _fcn_tree_iter_next(FcnTreeIter *it, ut64 from, ut64 to) {
+	RBNode *x_ = it->cur, *y_;
+	RAnalFunction *x = FCN_CONTAINER (x_), *y;
+	for (;;) {
+		if ((y_ = x_->child[1]) && (y = FCN_CONTAINER (y_), from <= y->rb_max_addr)) {
+			it->cur = _fcn_tree_probe (it, y_, from, to);
+			break;
+		}
+		if (!it->len) {
+			it->cur = NULL;
+			break;
+		}
+		x_ = it->path[--it->len];
+		x = FCN_CONTAINER (x_);
+		if (to - 1 < x->addr) {
+			it->cur = NULL;
+			break;
+		}
+		if (from <= x->addr + (x->_size == 0 ? 0 : x->_size - 1)) {
+			it->cur = x_;
+			break;
+		}
+	}
+}
+
+R_API int r_anal_fcn_resize(const RAnal *anal, RAnalFunction *fcn, int newsize) {
 	ut64 eof; /* end of function */
 	RAnalBlock *bb;
 	RListIter *iter, *iter2;
 	if (!fcn || newsize < 1) {
 		return false;
 	}
-	r_anal_fcn_set_size (fcn, newsize);
+	r_anal_fcn_set_size (anal, fcn, newsize);
 	eof = fcn->addr + r_anal_fcn_size (fcn);
 	r_list_foreach_safe (fcn->bbs, iter, iter2, bb) {
 		if (bb->addr >= eof) {
@@ -112,10 +294,6 @@ R_API RAnalFunction *r_anal_fcn_new() {
 	fcn->cc = NULL;
 	/* Function attributes: weak/noreturn/format/etc */
 	fcn->addr = UT64_MAX;
-#if FCN_OLD
-	fcn->refs = r_anal_ref_list_new ();
-	fcn->xrefs = r_anal_ref_list_new ();
-#endif
 	fcn->fcn_locs = NULL;
 	fcn->bbs = r_anal_bb_list_new ();
 	fcn->fingerprint = NULL;
@@ -142,10 +320,6 @@ R_API void r_anal_fcn_free(void *_fcn) {
 	free (fcn->name);
 	free (fcn->attr);
 	r_tinyrange_fini (&fcn->bbr);
-#if FCN_OLD
-	r_list_free (fcn->refs);
-	r_list_free (fcn->xrefs);
-#endif
 	// all functions are freed in anal->fcns
 	fcn->fcn_locs = NULL;
 	if (fcn->bbs) {
@@ -159,6 +333,7 @@ R_API void r_anal_fcn_free(void *_fcn) {
 	free (fcn);
 }
 
+#if 0
 static bool refExists(RList *refs, RAnalRef *ref) {
 	RAnalRef *r;
 	RListIter *iter;
@@ -170,64 +345,7 @@ static bool refExists(RList *refs, RAnalRef *ref) {
 	}
 	return false;
 }
-
-R_API int r_anal_fcn_xref_add(RAnal *a, RAnalFunction *fcn, ut64 at, ut64 addr, int type) {
-	RAnalRef *ref;
-	if (!fcn || !a) {
-		return false;
-	}
-	if (!a->iob.is_valid_offset (a->iob.io, addr, 0)) {
-		return false;
-	}
-	ref = r_anal_ref_new ();
-	if (!ref) {
-		return false;
-	}
-	// set global reference
-// r_cons_printf ("C 0x%llx  0x%llx\n", at, addr);
-	r_anal_xrefs_set (a, type, at, addr);
-	// set per-function reference
-#if FCN_OLD
-// TOO OLD we shouldnt be storing this.. or we do?
-	ref->at = at; // from
-	ref->addr = addr; // to
-	ref->type = type;
-	// TODO: ensure we are not dupping xrefs
-	if (refExists (fcn->refs, ref)) {
-		r_anal_ref_free (ref);
-	} else {
-		r_list_append (fcn->refs, ref);
-	}
 #endif
-#if FCN_SDB
-	sdb_add (DB, sdb_fmt (0, "fcn.0x%08"PFMT64x ".name", fcn->addr), fcn->name, 0);
-	// encode the name in base64 ?
-	sdb_num_add (DB, sdb_fmt (0, "fcn.name.%s", fcn->name), fcn->addr, 0);
-	sdb_array_add_num (DB, sdb_fmt (0, "fcn.0x%08"PFMT64x ".xrefs", fcn->addr), at, 0);
-#endif
-	return true;
-}
-
-R_API int r_anal_fcn_xref_del(RAnal *a, RAnalFunction *fcn, ut64 at, ut64 addr, int type) {
-#if FCN_OLD
-	RAnalRef *ref;
-	RListIter *iter;
-	/* No need for _safe loop coz we return immediately after the delete. */
-	r_list_foreach (fcn->xrefs, iter, ref) {
-		if ((type != -1 || type == ref->type) &&
-		(at == 0LL || at == ref->at) &&
-		(addr == 0LL || addr == ref->addr)) {
-			r_list_delete (fcn->xrefs, iter);
-			return true;
-		}
-	}
-#endif
-#if FCN_SDB
-	// TODO
-	// sdb_array_delete_num (DB, key, at, 0);
-#endif
-	return false;
-}
 
 static RAnalBlock *bbget(RAnalFunction *fcn, ut64 addr) {
 	RListIter *iter;
@@ -263,32 +381,32 @@ static RAnalBlock *appendBasicBlock(RAnal *anal, RAnalFunction *fcn, ut64 addr) 
 
 #define FITFCNSZ() {\
 		st64 n = bb->addr + bb->size - fcn->addr;\
-		if (n >= 0 && r_anal_fcn_size (fcn) < n) { r_anal_fcn_set_size (fcn, n); } }\
+		if (n >= 0 && r_anal_fcn_size (fcn) < n) { r_anal_fcn_set_size (NULL, fcn, n); } }\
 	if (r_anal_fcn_size (fcn) > MAX_FCN_SIZE) {\
 		/* eprintf ("Function too big at 0x%"PFMT64x" + %d\n", bb->addr, fcn->size); */\
-		r_anal_fcn_set_size (fcn, 0);\
+		r_anal_fcn_set_size (NULL, fcn, 0);\
 		return R_ANAL_RET_ERROR; }
 
 // ETOOSLOW
 static char *get_varname(RAnal *a, RAnalFunction *fcn, char type, const char *pfx, int idx) {
 	char *varname = r_str_newf ("%s_%xh", pfx, idx);
 	int i = 2;
+	char v_kind;
+	int v_delta;
 	while (1) {
-		RAnalVar *v = r_anal_var_get_byname (a, fcn, varname);
-		if (!v) {
-			v = r_anal_var_get_byname (a, fcn, varname);
-		}
-		if (!v) {
-			v = r_anal_var_get_byname (a, fcn, varname);
-		}
-		if (!v) {
+		char *name_key = sdb_fmt ("var.0x%"PFMT64x ".%d.%s", fcn->addr, 1, varname);
+		char *name_value = sdb_get (DB, name_key, 0);
+		if (!name_value) {
 			break;
 		}
-		if (v->kind == type && R_ABS (v->delta) == idx) {
-			r_anal_var_free (v);
+		const char *comma = strchr (name_value, ',');
+		if (comma && *comma) {
+			v_delta = r_num_math (NULL, comma + 1);
+			v_kind = *name_value;
+		}
+		if (v_kind == type && R_ABS (v_delta) == idx) {
 			break;
 		}
-		r_anal_var_free (v);
 		free (varname);
 		varname = r_str_newf ("%s_%xh_%d", pfx, idx, i);
 		i++;
@@ -305,15 +423,38 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut6
 		free (bbuf);\
 }
 
-static int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut64 ip, ut64 ptr, int ret0) {
+static void queue_case(RAnal *anal, ut64 switch_addr, ut64 case_addr, ut64 id, ut64 case_addr_loc) {
+	// eprintf("\tqueue_case: 0x%"PFMT64x " from 0x%"PFMT64x "\n", case_addr, case_addr_loc);
+	anal->cmdtail = r_str_appendf (anal->cmdtail,
+		"axc 0x%"PFMT64x " 0x%"PFMT64x "\n",
+		case_addr, switch_addr);
+	anal->cmdtail = r_str_appendf (anal->cmdtail,
+		"afbe 0x%"PFMT64x " 0x%"PFMT64x "\n",
+		switch_addr, case_addr);
+	// anal->cmdtail = r_str_appendf (anal->cmdtail,
+	// 	"aho case %d: from 0x%"PFMT64x " @ 0x%"PFMT64x "\n",
+	// 	id, switch_addr, case_addr_loc);
+	// anal->cmdtail = r_str_appendf (anal->cmdtail,
+	// 	"CCu case %d: @ 0x%"PFMT64x "\n",
+	// 	id, case_addr);
+	anal->cmdtail = r_str_appendf (anal->cmdtail,
+		"f case.%d.0x%"PFMT64x " 1 @ 0x%08"PFMT64x "\n",
+		id, case_addr, case_addr);
+}
+
+static int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut64 ip, ut64 jmptbl_loc, ut64 jmptbl_off, ut64 sz, ut64 jmptbl_size, ut64 default_case, int ret0) {
 	int ret = ret0;
-	ut8 *jmptbl = malloc (MAX_JMPTBL_SIZE);
-	ut64 jmpptr, offs, sz = anal->bits >> 3;
+	// jmptbl_size can not always be determined
+	if (jmptbl_size == 0) {
+		jmptbl_size = JMPTBLSZ;
+	}
+	ut64 jmpptr, offs;
+	ut8 *jmptbl = malloc (jmptbl_size * sz);
 	if (!jmptbl) {
 		return 0;
 	}
-	anal->iob.read_at (anal->iob.io, ptr, jmptbl, MAX_JMPTBL_SIZE);
-	for (offs = 0; offs + sz - 1 < MAX_JMPTBL_SIZE; offs += sz) {
+	anal->iob.read_at (anal->iob.io, jmptbl_loc, jmptbl, jmptbl_size * sz);
+	for (offs = 0; offs + sz - 1 < jmptbl_size * sz; offs += sz) {
 		switch (sz) {
 		case 1:
 			jmpptr = r_read_le8 (jmptbl + offs);
@@ -331,8 +472,16 @@ static int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut
 			jmpptr = r_read_le64 (jmptbl + offs);
 			break;
 		}
+		// if we don't check for 0 here, the next check with ptr+jmpptr
+		// will obviously be a good offset since it will be the start
+		// of the table, which is not what we want
+		if (jmpptr == 0) {
+			break;
+		}
+
 		if (!anal->iob.is_valid_offset (anal->iob.io, jmpptr, 0)) {
-			jmpptr = ptr + (st32) jmpptr;
+			// jump tables where sign extended movs are used
+			jmpptr = jmptbl_off + (st32) jmpptr;
 			if (!anal->iob.is_valid_offset (anal->iob.io, jmpptr, 0)) {
 				break;
 			}
@@ -342,13 +491,29 @@ static int try_walkthrough_jmptbl(RAnal *anal, RAnalFunction *fcn, int depth, ut
 				break;
 			}
 		}
-		// if (jmpptr < ip - MAX_JMPTBL_JMP || jmpptr > ip + MAX_JMPTBL_JMP) { break; }
+		queue_case (anal, ip, jmpptr, offs/sz, jmptbl_loc + offs);
 		recurseAt (jmpptr);
 	}
+
+	if (offs > 0) {
+		// eprintf("\n\nSwitch statement at 0x%llx:\n", ip);
+		anal->cmdtail = r_str_appendf (anal->cmdtail,
+			"CCu switch table (%d cases) at 0x%"PFMT64x " @ 0x%"PFMT64x "\n",
+			offs/sz, jmptbl_loc, ip);
+		anal->cmdtail = r_str_appendf (anal->cmdtail,
+			"f switch.0x%08"PFMT64x" 1 @ 0x%08"PFMT64x"\n",
+			ip, ip);
+
+		anal->cmdtail = r_str_appendf (anal->cmdtail,
+			"f case.default.0x%"PFMT64x " 1 @ 0x%08"PFMT64x "\n",
+			default_case, default_case);
+	}
+
 	free (jmptbl);
 	return ret;
 }
 
+#if 0
 static ut64 search_reg_val(RAnal *anal, ut8 *buf, ut64 len, ut64 addr, char *regsz) {
 	ut64 offs, oplen;
 	RAnalOp op = {
@@ -358,7 +523,7 @@ static ut64 search_reg_val(RAnal *anal, ut8 *buf, ut64 len, ut64 addr, char *reg
 	const int addrbytes = anal->iob.io ? anal->iob.io->addrbytes : 1;
 	for (offs = 0; offs < len; offs += addrbytes * oplen) {
 		r_anal_op_fini (&op);
-		if ((oplen = r_anal_op (anal, &op, addr + offs, buf + offs, len - offs)) < 1) {
+		if ((oplen = r_anal_op (anal, &op, addr + offs, buf + offs, len - offs, R_ANAL_OP_MASK_ALL)) < 1) {
 			break;
 		}
 		if (op.dst && op.dst->reg && op.dst->reg->name && !strcmp (op.dst->reg->name, regsz)) {
@@ -369,6 +534,7 @@ static ut64 search_reg_val(RAnal *anal, ut8 *buf, ut64 len, ut64 addr, char *reg
 	}
 	return ret;
 }
+#endif
 
 #define gotoBeach(x) ret = x; goto beach;
 #define gotoBeachRet() goto beach;
@@ -395,36 +561,40 @@ static void extract_arg(RAnal *anal, RAnalFunction *fcn, RAnalOp *op, const char
 		free (esil_buf);
 		return;
 	}
-#if 1
 	*ptr_end = 0;
 	addr = ptr_end;
 	while ((addr[0] != '0' || addr[1] != 'x') && addr >= esil_buf + 1 && *addr != ',') {
 		addr--;
 	}
 	if (strncmp (addr, "0x", 2)) {
-		free (esil_buf);
-		return;
+		//XXX: This is a workaround for inconsistent esil
+		if ((op->stackop == R_ANAL_STACK_SET) || (op->stackop == R_ANAL_STACK_GET)) {
+			ptr = R_ABS (op->ptr);
+			if (ptr%4) {
+				goto beach;
+			}
+		} else {
+			goto beach;
+		}
+	} else {
+		ptr = (st64) r_num_get (NULL, addr);
 	}
-	ptr = (st64) r_num_get (NULL, addr);
-#else
-	ptr = -op->ptr;
-	if (ptr%4) {
-		free (esil_buf);
-		return;
-	}
-#endif
+	//XXX: This won't work for stack based var/arg
+	int rw = (op->stackop == R_ANAL_STACK_SET) ? 1 : 0;
 	if (*sign == '+') {
-		const char *pfx = (ptr < fcn->maxstack && type == 's')? VARPREFIX: ARGPREFIX;
+		const char *pfx = ((ptr < fcn->maxstack) && (type == 's')) ? VARPREFIX : ARGPREFIX;
+		bool isarg = strcmp(pfx , ARGPREFIX) ? false : true;
 		char *varname = get_varname (anal, fcn, type, pfx, R_ABS (ptr));
-		r_anal_var_add (anal, fcn->addr, 1, ptr, type, NULL, anal->bits / 8, varname);
-		r_anal_var_access (anal, fcn->addr, type, 1, ptr, 0, op->addr);
+		r_anal_var_add (anal, fcn->addr, 1, ptr, type, NULL, anal->bits / 8, isarg, varname);
+		r_anal_var_access (anal, fcn->addr, type, 1, ptr, rw, op->addr);
 		free (varname);
 	} else {
 		char *varname = get_varname (anal, fcn, type, VARPREFIX, R_ABS (ptr));
-		r_anal_var_add (anal, fcn->addr, 1, -ptr, type, NULL, anal->bits / 8, varname);
-		r_anal_var_access (anal, fcn->addr, type, 1, -ptr, 1, op->addr);
+		r_anal_var_add (anal, fcn->addr, 1, -ptr, type, NULL, anal->bits / 8, 0, varname);
+		r_anal_var_access (anal, fcn->addr, type, 1, -ptr, rw, op->addr);
 		free (varname);
 	}
+beach:
 	free (esil_buf);
 }
 
@@ -445,42 +615,218 @@ static bool isInvalidMemory(const ut8 *buf, int len) {
 	// return buf[0]==buf[1] && buf[0]==0xff && buf[2]==0xff && buf[3] == 0xff;
 }
 
-static bool is_delta_pointer_table(RAnal *anal, ut64 addr, ut64 ptr) {
+static bool isSymbolNextInstruction(RAnal *anal, RAnalOp *op) {
+	if (!anal || !op || !anal->flb.get_at) {
+ 		return false;
+	}
+	RFlagItem *fi = anal->flb.get_at (anal->flb.f, op->addr + op->size, false);
+	return (fi && fi->name && (strstr (fi->name, "imp.") || strstr (fi->name, "sym.")
+			|| strstr (fi->name, "entry") || strstr (fi->name, "main")));
+}
+
+static bool is_delta_pointer_table (RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 lea_ptr, ut64 *jmptbl_addr, RAnalOp *jmp_aop) {
 	int i;
 	ut64 dst;
 	st32 jmptbl[64] = {
-		0
-	};
+		0};
 	/* check if current instruction is followed by an ujmp */
-	ut8 buf[64];
-	anal->iob.read_at (anal->iob.io, addr, (ut8 *) buf, 64);
-	RAnalOp aop = {0};
+	ut8 buf[JMPTBL_LEA_SEARCH_SZ];
+	RAnalOp *aop = jmp_aop;
+	RAnalOp mov_aop = {0};
+	RAnalOp add_aop = {0};
+	anal->iob.read_at (anal->iob.io, addr, (ut8 *)buf, JMPTBL_LEA_SEARCH_SZ);
 	bool isValid = false;
-	for (i = 0; i + 8 < 64; i++) {
-		int len = r_anal_op (anal, &aop, addr + i, buf + i, 64 - i);
+	for (i = 0; i + 8 < JMPTBL_LEA_SEARCH_SZ; i++) {
+		int len = r_anal_op (anal, aop, addr + i, buf + i, JMPTBL_LEA_SEARCH_SZ - i, R_ANAL_OP_MASK_BASIC);
 		if (len < 1) {
 			len = 1;
 		}
-		if (aop.type == R_ANAL_OP_TYPE_UJMP || aop.type == R_ANAL_OP_TYPE_RJMP) {
+		if (aop->type == R_ANAL_OP_TYPE_UJMP || aop->type == R_ANAL_OP_TYPE_RJMP) {
 			isValid = true;
 			break;
+		}
+		if (aop->type == R_ANAL_OP_TYPE_MOV) {
+			mov_aop = *aop;
+		}
+		if (aop->type == R_ANAL_OP_TYPE_ADD) {
+			add_aop = *aop;
 		}
 		i += len - 1;
 	}
 	if (!isValid) {
 		return false;
 	}
-	
+
+	// check if we have a msvc 19xx style jump table using rva table entries
+	// lea reg1, [base_addr]
+	// mov reg2, sword [reg1 + tbl_off*4 + tbl_loc_off]
+	// add reg2, reg1
+	// jmp reg2
+	if (mov_aop.type && add_aop.type && mov_aop.addr < add_aop.addr && add_aop.addr < jmp_aop->addr && mov_aop.ptr) {
+		// ptr in this case should be tbl_loc_off
+		*jmptbl_addr += mov_aop.ptr;
+	}
+
 	/* check if jump table contains valid deltas */
-	anal->iob.read_at (anal->iob.io, ptr, (ut8 *) &jmptbl, 64);
+	anal->iob.read_at (anal->iob.io, *jmptbl_addr, (ut8 *)&jmptbl, 64);
 	// XXX this is not endian safe
-	for (i = 0; i < 4; i++) {
-		dst = ptr + jmptbl[0];
+	for (i = 0; i < 3; i++) {
+		dst = lea_ptr + jmptbl[0];
 		if (!anal->iob.is_valid_offset (anal->iob.io, dst, 0)) {
+			return false;
+		}
+		if (dst > fcn->addr + JMPTBL_MAXFCNSIZE) {
+			return false;
+		}
+		if (anal->opt.jmpabove && dst < (fcn->addr < JMPTBL_MAXFCNSIZE ? 0 : fcn->addr - JMPTBL_MAXFCNSIZE)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+static bool try_get_delta_jmptbl_info (RAnal *anal, RAnalFunction *fcn, ut64 jmp_addr, ut64 lea_addr, ut64 *table_size, ut64 *default_case) {
+	bool isValid = false, foundCmp = false;
+	int i;
+
+	RAnalOp tmp_aop = {0};
+	int search_sz = jmp_addr - lea_addr;
+	if (search_sz < 0) {
+		return false;
+	}
+	ut8 *buf = malloc (search_sz);
+	if (!buf) {
+		return false;
+	}
+	// search for a cmp register with a resonable size
+	anal->iob.read_at (anal->iob.io, lea_addr, (ut8 *)buf, search_sz);
+
+	for (i = 0; i + 8 < search_sz; i++) {
+		int len = r_anal_op (anal, &tmp_aop, lea_addr + i, buf + i, JMPTBL_LEA_SEARCH_SZ - i, R_ANAL_OP_MASK_BASIC);
+		if (len < 1) {
+			len = 1;
+		}
+
+		if (foundCmp) {
+			if (tmp_aop.type != R_ANAL_OP_TYPE_CJMP) {
+				continue;
+			}
+
+			*default_case = tmp_aop.jump == tmp_aop.jump + len ? tmp_aop.fail : tmp_aop.jump;
+			break;
+		}
+
+		if (tmp_aop.type != R_ANAL_OP_TYPE_CMP) {
+			continue;
+		}
+		// get the value of the cmp
+		// for operands in op, check if type is immediate and val is sane
+		// TODO: How? opex?
+
+		// for the time being, this seems to work
+		// might not actually have a value, let the next step figure out the size then
+		if (tmp_aop.val == UT64_MAX && tmp_aop.refptr == 0) {
+			isValid = true;
+			*table_size = 0;
+		} else if (tmp_aop.refptr == 0) {
+			isValid = tmp_aop.val < 0x200;
+			*table_size = tmp_aop.val + 1;
+		} else {
+			isValid = tmp_aop.refptr < 0x200;
+			*table_size = tmp_aop.refptr + 1;
+		}
+
+		// TODO: check the jmp for whether val is included in valid range or not (ja vs jae)
+		foundCmp = true;
+	}
+	free (buf);
+	if (!isValid) {
+		return false;
+	}
+
+	// eprintf ("switch at 0x%" PFMT64x "\n\tdefault case 0x%" PFMT64x "\n\t#cases: %d\n",
+	// 		addr,
+	// 		*default_case,
+	// 		*table_size);
+
+	return true;
+}
+
+static bool try_get_jmptbl_info(RAnal *anal, RAnalFunction *fcn, ut64 addr, RAnalBlock *my_bb, ut64 *table_size, ut64 *default_case) {
+	bool isValid = false;
+	int i;
+	RListIter *iter;
+	RAnalBlock *tmp_bb, *prev_bb;
+	prev_bb = 0;
+	if (!fcn->bbs) {
+		return false;
+	}
+
+	// search for the predecessor bb
+	r_list_foreach (fcn->bbs, iter, tmp_bb) {
+		if (tmp_bb->jump == my_bb->addr || tmp_bb->fail == my_bb->addr) {
+			prev_bb = tmp_bb;
+			break;
+		}
+	}
+	// predecessor must be a conditional jump
+	if (!prev_bb || !prev_bb->jump || !prev_bb->fail) {
+		eprintf ("missing cjmp bb in predecesor\n");
+		return false;
+	}
+
+	// default case is the jump target of the unconditional jump
+	*default_case = prev_bb->jump == my_bb->addr ? prev_bb->fail : prev_bb->jump;
+
+	RAnalOp tmp_aop = {0};
+	ut8 *bb_buf = malloc (prev_bb->size);
+	if (!bb_buf) {
+		return false;
+	}
+	// search for a cmp register with a resonable size
+	anal->iob.read_at (anal->iob.io, prev_bb->addr, (ut8 *) bb_buf, prev_bb->size);
+	isValid = false;
+
+	for (i = 0; i < prev_bb->op_pos_size; i++) {
+		ut64 addr = prev_bb->addr + prev_bb->op_pos[i];
+		int len = r_anal_op (anal, &tmp_aop, addr, bb_buf + prev_bb->op_pos[i], prev_bb->size - prev_bb->op_pos[i], R_ANAL_OP_MASK_BASIC);
+
+		if (len < 1 || tmp_aop.type != R_ANAL_OP_TYPE_CMP) {
+			continue;
+		}
+		// get the value of the cmp
+		// for operands in op, check if type is immediate and val is sane
+		// TODO: How? opex?
+
+
+		// for the time being, this seems to work
+		// might not actually have a value, let the next step figure out the size then
+		if (tmp_aop.val == UT64_MAX && tmp_aop.refptr == 0) {
+			isValid = true;
+			*table_size = 0;
+		} else if (tmp_aop.refptr == 0) {
+			isValid = tmp_aop.val < 0x200;
+			*table_size = tmp_aop.val + 1;
+		} else {
+			isValid = tmp_aop.refptr < 0x200;
+			*table_size = tmp_aop.refptr + 1;
+		}
+
+		// TODO: check the jmp for whether val is included in valid range or not (ja vs jae)
+
+		break;
+	}
+	free (bb_buf);
+	if (!isValid) {
+		return false;
+	}
+
+	// eprintf ("switch at 0x%" PFMT64x "\n\tdefault case 0x%" PFMT64x "\n\t#cases: %d\n",
+	// 		addr,
+	// 		*default_case,
+	// 		*table_size);
+
+ 	return true;
 }
 
 static bool regs_exist(RAnalValue *src, RAnalValue *dst) {
@@ -516,7 +862,7 @@ R_API int r_anal_case(RAnal *anal, RAnalFunction *fcn, ut64 addr_bbsw, ut64 addr
 			break;
 		}
 		r_anal_op_fini (&op);
-		if ((oplen = r_anal_op (anal, &op, addr + idx, buf + idx, len - idx)) < 1) {
+		if ((oplen = r_anal_op (anal, &op, addr + idx, buf + idx, len - idx, R_ANAL_OP_MASK_BASIC)) < 1) {
 			return 0;
 		}
 		switch (op.type) {
@@ -535,12 +881,14 @@ R_API int r_anal_case(RAnal *anal, RAnalFunction *fcn, ut64 addr_bbsw, ut64 addr
 	return idx;
 }
 
+#if 0
 static int walk_switch(RAnal *anal, RAnalFunction *fcn, ut64 from, ut64 at) {
 	ut8 buf[1024];
 	int i;
 	eprintf ("WALK SWITCH TABLE INTO (0x%"PFMT64x ") %"PFMT64x "\n", from, at);
 	for (i = 0; i < 10; i++) {
-		anal->iob.read_at (anal->iob.io, at, buf, sizeof (buf));
+		(void) anal->iob.read_at (anal->iob.io, at, buf, sizeof (buf));
+		// TODO check for return value
 		int sz = r_anal_case (anal, fcn, from, at, buf, sizeof (buf), 0);
 		if (sz < 1) {
 			break;
@@ -549,6 +897,7 @@ static int walk_switch(RAnal *anal, RAnalFunction *fcn, ut64 from, ut64 at) {
 	}
 	return 0;
 }
+#endif
 
 static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut64 len, int depth) {
 	const int continue_after_jump = anal->opt.afterjmp;
@@ -558,7 +907,6 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut6
 	RAnalBlock *bbg = NULL;
 	int ret = R_ANAL_RET_END, skip_ret = 0;
 	int overlapped = 0;
-	char *varname;
 	RAnalOp op = {
 		0
 	};
@@ -574,6 +922,9 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut6
 		0
 	};
 	char tmp_buf[MAX_FLG_NAME_SIZE + 5] = "skip";
+	if (r_cons_is_breaked ()) {
+		return R_ANAL_RET_END;
+	}
 
 	if (anal->sleep) {
 		r_sys_usleep (anal->sleep);
@@ -621,7 +972,12 @@ static int fcn_recurse(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut6
 			break;
 		}
 repeat:
+		if (r_cons_is_breaked ()) {
+			break;
+		}
 		if ((len - addrbytes * idx) < 5) {
+			eprintf (" WARNING : block size exceeding max block size at 0x%08"PFMT64x"\n", addr);
+			eprintf ("[+] Try changing it with e anal.bb.maxsize\n");
 			break;
 		}
 		r_anal_op_fini (&op);
@@ -632,13 +988,16 @@ repeat:
 		}
 		// check if opcode is in another basic block
 		// in that case we break
-		if ((oplen = r_anal_op (anal, &op, addr + idx, buf + addrbytes * idx, len - addrbytes * idx)) < 1) {
+		if ((oplen = r_anal_op (anal, &op, addr + idx, buf + addrbytes * idx, len - addrbytes * idx, R_ANAL_OP_MASK_ALL)) < 1) {
 			VERBOSE_ANAL eprintf ("Unknown opcode at 0x%08"PFMT64x "\n", addr + idx);
 			if (!idx) {
 				gotoBeach (R_ANAL_RET_END);
 			} else {
 				break; // unspecified behaviour
 			}
+		}
+		if (op.hint.new_bits) {
+			r_anal_hint_set_bits (anal, op.jump, op.hint.new_bits);
 		}
 		if (idx > 0 && !overlapped) {
 			bbg = bbget (fcn, addr + idx);
@@ -719,36 +1078,17 @@ repeat:
 		case R_ANAL_STACK_RESET:
 			bb->stackptr = 0;
 			break;
-		// TODO: use fcn->maxstack to know our stackframe
-		case R_ANAL_STACK_SET:
-			if ((int) op.ptr > 0) {
-				varname = get_varname (anal, fcn, 'b', ARGPREFIX, R_ABS (op.ptr));
-			} else {
-				varname = get_varname (anal, fcn, 'b', VARPREFIX, R_ABS (op.ptr));
-			}
-			r_anal_var_add (anal, fcn->addr, 1, op.ptr, 'b', NULL, anal->bits / 8, varname);
-			r_anal_var_access (anal, fcn->addr, 'b', 1, op.ptr, 1, op.addr);
-			free (varname);
-			break;
-		// TODO: use fcn->maxstack to know our stackframe
-		case R_ANAL_STACK_GET:
-			if (((int) op.ptr) > 0) {
-				varname = get_varname (anal, fcn, 'b', ARGPREFIX, R_ABS (op.ptr));
-			} else {
-				varname = get_varname (anal, fcn, 'b', VARPREFIX, R_ABS (op.ptr));
-			}
-			r_anal_var_add (anal, fcn->addr, 1, op.ptr, 'b', NULL, anal->bits / 8, varname);
-			r_anal_var_access (anal, fcn->addr, 'b', 1, op.ptr, 0, op.addr);
-			free (varname);
-			break;
 		}
-
+		if (anal->opt.vars) {
+			r_anal_fcn_fill_args (anal, fcn, &op);
+		}
 		if (op.ptr && op.ptr != UT64_MAX && op.ptr != UT32_MAX) {
 			// swapped parameters wtf
-			r_anal_fcn_xref_add (anal, fcn, op.addr, op.ptr, R_ANAL_REF_TYPE_DATA);
+			r_anal_xrefs_set (anal, op.addr, op.ptr, R_ANAL_REF_TYPE_DATA);
 		}
 
 		switch (op.type & R_ANAL_OP_TYPE_MASK) {
+		case R_ANAL_OP_TYPE_CMOV:
 		case R_ANAL_OP_TYPE_MOV:
 			// skip mov reg,reg
 			if (anal->opt.hpskip && regs_exist (op.src[0], op.dst)
@@ -775,20 +1115,34 @@ repeat:
 				}
 			}
 			if (anal->opt.jmptbl) {
-				if (is_delta_pointer_table (anal, op.addr, op.ptr)) {
-					char *str = r_str_newf ("pxt. 0x%08" PFMT64x" @ 0x%08"PFMT64x "\n", op.addr, op.ptr);
-					if (!anal->cmdtail) {
-						anal->cmdtail = r_str_appendf (anal->cmdtail, str);
+				RAnalOp jmp_aop = {0};
+				ut64 jmptbl_addr = op.ptr;
+				if (is_delta_pointer_table (anal, fcn, op.addr, op.ptr, &jmptbl_addr, &jmp_aop)) {
+					ut64 table_size, default_case;
+					// we require both checks here since try_get_jmptbl_info uses
+					// BB info of the final jmptbl jump, which is no present with
+					// is_delta_pointer_table just scanning ahead
+					// try_get_delta_jmptbl_info doesn't work at times where the
+					// lea comes after the cmp/default case cjmp, which can be
+					// handled with try_get_jmptbl_info
+					if (try_get_jmptbl_info(anal, fcn, jmp_aop.addr, bb, &table_size, &default_case)
+						|| try_get_delta_jmptbl_info(anal, fcn, jmp_aop.addr, op.addr, &table_size, &default_case)) {
+						ret = try_walkthrough_jmptbl (anal, fcn, depth, jmp_aop.addr, jmptbl_addr, op.ptr, 4, table_size, default_case, 4);
 					}
-					if (anal->cmdtail && !strstr (anal->cmdtail, str)) {
-						anal->cmdtail = r_str_appendf (anal->cmdtail, str);
-					} 
-					free (str);
-					// jmptbl_addr = op.ptr;
-					// jmptbl_size = -1;
-					// ret = try_walkthrough_jmptbl (anal, fcn, depth, op.addr, op.ptr, 4);
 				}
 			}
+			break;
+		// Case of valid but unused "add [rax], al"
+		case R_ANAL_OP_TYPE_ADD:
+			if (anal->opt.ijmp) {
+				if (((op.size + 4) <= len) && !memcmp (buf + op.size, "\x00\x00\x00\x00", 4)) {
+					bb->size -= oplen;
+					op.type = R_ANAL_OP_TYPE_RET;
+					FITFCNSZ ();
+					r_anal_op_fini (&op);
+					gotoBeach (R_ANAL_RET_END);
+				}
+      }
 			break;
 		case R_ANAL_OP_TYPE_ILL:
 			if (anal->opt.nopskip && len > 3 && !memcmp (buf, "\x00\x00\x00\x00", 4)) {
@@ -865,8 +1219,11 @@ repeat:
 				r_anal_op_fini (&op);
 				return R_ANAL_RET_END;
 			}
+			if (r_cons_is_breaked ()) {
+				return R_ANAL_RET_END;
+			}
 			if (anal->opt.jmpref) {
-				(void) r_anal_fcn_xref_add (anal, fcn, op.addr, op.jump, R_ANAL_REF_TYPE_CODE);
+				(void) r_anal_xrefs_set (anal, op.addr, op.jump, R_ANAL_REF_TYPE_CODE);
 			}
 			if (!anal->opt.jmpabove && (op.jump < fcn->addr)) {
 				FITFCNSZ ();
@@ -877,6 +1234,9 @@ repeat:
 				FITFCNSZ ();
 				r_anal_op_fini (&op);
 				return R_ANAL_RET_END;
+			}
+			if (r_cons_is_breaked ()) {
+				break;
 			}
 			{
 				bool must_eob = anal->opt.eobjmp;
@@ -958,8 +1318,7 @@ repeat:
 			break;
 		case R_ANAL_OP_TYPE_CJMP:
 			if (anal->opt.cjmpref) {
-				(void) r_anal_fcn_xref_add (anal, fcn,
-					op.addr, op.jump, R_ANAL_REF_TYPE_CODE);
+				(void) r_anal_xrefs_set (anal, op.addr, op.jump, R_ANAL_REF_TYPE_CODE);
 			}
 			if (!overlapped) {
 				bb->jump = op.jump;
@@ -1029,23 +1388,25 @@ repeat:
 		case R_ANAL_OP_TYPE_ICALL:
 		case R_ANAL_OP_TYPE_IRCALL:
 			/* call [dst] */
+			// XXX: this is TYPE_MCALL or indirect-call
+			(void) r_anal_xrefs_set (anal, op.addr, op.ptr, R_ANAL_REF_TYPE_CALL);
+
 			if (op.ptr != UT64_MAX && r_anal_noreturn_at (anal, op.ptr)) {
 				FITFCNSZ ();
 				r_anal_op_fini (&op);
 				return R_ANAL_RET_END;
 			}
-			// XXX: this is TYPE_MCALL or indirect-call
-			(void) r_anal_fcn_xref_add (anal, fcn, op.addr, op.ptr, R_ANAL_REF_TYPE_CALL);
 			break;
 		case R_ANAL_OP_TYPE_CCALL:
 		case R_ANAL_OP_TYPE_CALL:
 			/* call dst */
+			(void) r_anal_xrefs_set (anal, op.addr, op.jump, R_ANAL_REF_TYPE_CALL);
+
 			if (r_anal_noreturn_at (anal, op.jump)) {
 				FITFCNSZ ();
 				r_anal_op_fini (&op);
 				return R_ANAL_RET_END;
 			}
-			(void) r_anal_fcn_xref_add (anal, fcn, op.addr, op.jump, R_ANAL_REF_TYPE_CALL);
 #if CALL_IS_EOB
 			recurseAt (op.jump);
 			recurseAt (op.fail);
@@ -1057,25 +1418,24 @@ repeat:
 		case R_ANAL_OP_TYPE_RJMP:
 		case R_ANAL_OP_TYPE_IJMP:
 		case R_ANAL_OP_TYPE_IRJMP:
+			// if the next instruction is a symbol
+			if (anal->opt.ijmp && isSymbolNextInstruction (anal, &op)) {
+				FITFCNSZ ();
+				r_anal_op_fini (&op);
+				return R_ANAL_RET_END;
+			}
 			// switch statement
 			if (anal->opt.jmptbl) {
-				if (fcn->refs->tail) {
-					RAnalRef *last_ref = fcn->refs->tail->data;
-					last_ref->type = R_ANAL_REF_TYPE_NULL;
-				}
-				if (op.ptr != UT64_MAX) {       // direct jump
-					ret = try_walkthrough_jmptbl (anal, fcn, depth, addr + idx, op.ptr, ret);
-
-				} else {        // indirect jump: table pointer is unknown
-					if (op.src[0] && op.src[0]->reg) {
-						ut64 ptr = search_reg_val (anal, buf, idx, addr, op.src[0]->reg->name);
-						if (ptr && ptr != UT64_MAX) {
-							ret = try_walkthrough_jmptbl (anal, fcn, depth, addr + idx, ptr, ret);
-						}
+				// op.ireg since rip relative addressing produces way too many false positives otherwise
+				// op.ireg is 0 for rip relative, "rax", etc otherwise
+				if (op.ptr != UT64_MAX && op.ireg) {       // direct jump
+					ut64 table_size, default_case;
+					if (try_get_jmptbl_info (anal, fcn, op.addr, bb, &table_size, &default_case)) {
+						ret = try_walkthrough_jmptbl (anal, fcn, depth, op.addr, op.ptr, op.ptr, anal->bits >> 3, table_size, default_case, ret);
 					}
 				}
-				walk_switch (anal, fcn, op.addr, op.addr + op.size);
 			}
+#if 0
 			if (anal->cur) {
 				/* if UJMP is in .plt section just skip it */
 				RBinSection *s = anal->binb.get_vsect_at (anal->binb.bin, addr);
@@ -1098,17 +1458,31 @@ repeat:
 					}
 				}
 			}
-			FITFCNSZ ();
-			r_anal_op_fini (&op);
-			return R_ANAL_RET_END;
-river:
+#endif
+			if (anal->opt.ijmp) {
+				if (continue_after_jump) {
+					recurseAt (op.jump);
+					recurseAt (op.fail);
+					if (overlapped) {
+						goto analopfinish;
+					}
+				}
+				if (r_anal_noreturn_at (anal, op.jump) || op.eob) {
+					goto analopfinish;
+				}
+			} else {
+analopfinish:
+				FITFCNSZ ();
+				r_anal_op_fini (&op);
+				return R_ANAL_RET_END;
+			}
 			break;
 		/* fallthru */
 		case R_ANAL_OP_TYPE_PUSH:
 			last_is_push = true;
 			last_push_addr = op.val;
 			if (anal->iob.is_valid_offset (anal->iob.io, op.val, 1)) {
-				(void) r_anal_fcn_xref_add (anal, fcn, op.addr, op.val, R_ANAL_REF_TYPE_DATA);
+				(void) r_anal_xrefs_set (anal, op.addr, op.val, R_ANAL_REF_TYPE_DATA);
 			}
 			break;
 		case R_ANAL_OP_TYPE_RET:
@@ -1171,7 +1545,7 @@ R_API bool r_anal_check_fcn(RAnal *anal, ut8 *buf, ut16 bufsz, ut64 addr, ut64 l
 	}
 	for (i = 0; i < bufsz && opcnt < 10; i += oplen, opcnt++) {
 		r_anal_op_fini (&op);
-		if ((oplen = r_anal_op (anal, &op, addr + i, buf + i, bufsz - i)) < 1) {
+		if ((oplen = r_anal_op (anal, &op, addr + i, buf + i, bufsz - i, R_ANAL_OP_MASK_BASIC)) < 1) {
 			return false;
 		}
 		switch (op.type) {
@@ -1203,7 +1577,7 @@ static void fcnfit(RAnal *a, RAnalFunction *f) {
 	RAnalFunction *next = r_anal_fcn_next (a, f->addr);
 	if (next) {
 		if ((f->addr + r_anal_fcn_size (f)) > next->addr) {
-			r_anal_fcn_resize (f, (next->addr - f->addr));
+			r_anal_fcn_resize (a, f, (next->addr - f->addr));
 		}
 	}
 }
@@ -1220,20 +1594,22 @@ R_API void r_anal_fcn_fit_overlaps(RAnal *anal, RAnalFunction *fcn) {
 	}
 }
 
-R_API void r_anal_trim_jmprefs(RAnalFunction *fcn) {
+R_API void r_anal_trim_jmprefs(RAnal *anal, RAnalFunction *fcn) {
 	RAnalRef *ref;
+	RList *refs = r_anal_fcn_get_refs (anal, fcn);
 	RListIter *iter;
-	RListIter *tmp;
-	r_list_foreach_safe (fcn->refs, iter, tmp, ref) {
+
+	r_list_foreach (refs, iter, ref) {
 		if (ref->type == R_ANAL_REF_TYPE_CODE && r_anal_fcn_is_in_offset (fcn, ref->addr)) {
-			r_list_delete (fcn->refs, iter);
+			r_anal_xrefs_deln (anal, ref->at, ref->addr, ref->type);
 		}
 	}
+	r_list_free (refs);
 }
 
 R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut64 len, int reftype) {
 	int ret;
-	r_anal_fcn_set_size (fcn, 0);
+	r_anal_fcn_set_size (NULL, fcn, 0); // fcn is not yet in anal => pass NULL
 	/* defines fcn. or loc. prefix */
 	fcn->type = (reftype == R_ANAL_REF_TYPE_CODE)
 	? R_ANAL_FCN_TYPE_LOC
@@ -1248,7 +1624,7 @@ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut64 
 		}
 	}
 	fcn->maxstack = 0;
-	ret = fcn_recurse (anal, fcn, addr, buf, len, FCN_DEPTH);
+	ret = fcn_recurse (anal, fcn, addr, buf, len, anal->opt.depth);
 	// update tinyrange for the function
 	r_anal_fcn_update_tinyrange_bbs (fcn);
 
@@ -1256,40 +1632,23 @@ R_API int r_anal_fcn(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut8 *buf, ut64 
 		RListIter *iter;
 		RAnalBlock *bb;
 		ut64 endaddr = fcn->addr;
-		ut64 overlapped = -1;
-		RAnalFunction *fcn1 = NULL;
 
 		// set function size as length of continuous sequence of bbs
 		r_list_sort (fcn->bbs, &cmpaddr);
 		r_list_foreach (fcn->bbs, iter, bb) {
 			if (endaddr == bb->addr) {
 				endaddr += bb->size;
-			} else if (endaddr < bb->addr &&
-			bb->addr - endaddr <
-			anal->opt.bbs_alignment &&
-			!(bb->addr &
-			(anal->opt.bbs_alignment - 1))) {
+			} else if (endaddr < bb->addr && bb->addr - endaddr < anal->opt.bbs_alignment && !(bb->addr & (anal->opt.bbs_alignment - 1))) {
 				endaddr = bb->addr + bb->size;
 			} else {
 				break;
 			}
 		}
 #if !JAYRO_04
-		r_anal_fcn_resize (fcn, endaddr - fcn->addr);
-
-		// resize function if overlaps
-		r_list_foreach (anal->fcns, iter, fcn1) {
-			if (fcn1->addr >= (fcn->addr) && fcn1->addr < (fcn->addr + r_anal_fcn_size (fcn))) {
-				if (overlapped > fcn1->addr) {
-					overlapped = fcn1->addr;
-				}
-			}
-		}
-		if (overlapped != -1) {
-			r_anal_fcn_resize (fcn, overlapped - fcn->addr);
-		}
+		// fcn is not yet in anal => pass NULL
+		r_anal_fcn_resize (NULL, fcn, endaddr - fcn->addr);
 #endif
-		r_anal_trim_jmprefs (fcn);
+		r_anal_trim_jmprefs (anal, fcn);
 	}
 	return ret;
 }
@@ -1301,12 +1660,9 @@ R_API int r_anal_fcn_insert(RAnal *anal, RAnalFunction *fcn) {
 	if (f) {
 		return false;
 	}
-#if USE_NEW_FCN_STORE
-	r_listrange_add (anal->fcnstore, fcn);
-	// HUH? store it here .. for backweird compatibility
-#endif
 	/* TODO: sdbization */
 	r_list_append (anal->fcns, fcn);
+	r_anal_fcn_tree_insert (&anal->fcn_tree, fcn);
 	if (anal->cb.on_fcn_new) {
 		anal->cb.on_fcn_new (anal, anal->user, fcn);
 	}
@@ -1325,7 +1681,7 @@ R_API int r_anal_fcn_add(RAnal *a, ut64 addr, ut64 size, const char *name, int t
 	fcn->addr = addr;
 	fcn->cc = r_str_const (r_anal_cc_default (a));
 	fcn->bits = a->bits;
-	r_anal_fcn_set_size (fcn, size);
+	r_anal_fcn_set_size (append ? NULL : a, fcn, size);
 	free (fcn->name);
 	if (!name) {
 		fcn->name = r_str_newf ("fcn.%08"PFMT64x, fcn->addr);
@@ -1342,7 +1698,7 @@ R_API int r_anal_fcn_add(RAnal *a, ut64 addr, ut64 size, const char *name, int t
 		}
 	}
 #if FCN_SDB
-	sdb_set (DB, sdb_fmt (0, "fcn.0x%08"PFMT64x, addr), "TODO", 0); // TODO: add more info here
+	sdb_set (DB, sdb_fmt ("fcn.0x%08"PFMT64x, addr), "TODO", 0); // TODO: add more info here
 #endif
 	return append? r_anal_fcn_insert (a, fcn): true;
 }
@@ -1351,9 +1707,6 @@ R_API int r_anal_fcn_del_locs(RAnal *anal, ut64 addr) {
 	RListIter *iter, *iter2;
 	RAnalFunction *fcn, *f = r_anal_get_fcn_in (anal, addr,
 		R_ANAL_FCN_TYPE_ROOT);
-#if USE_NEW_FCN_STORE
-#warning TODO: r_anal_fcn_del_locs not implemented for newstore
-#endif
 	if (!f) {
 		return false;
 	}
@@ -1362,6 +1715,7 @@ R_API int r_anal_fcn_del_locs(RAnal *anal, ut64 addr) {
 			continue;
 		}
 		if (r_anal_fcn_in (fcn, addr)) {
+			r_anal_fcn_tree_delete (&anal->fcn_tree, fcn);
 			r_list_delete (anal->fcns, iter);
 		}
 	}
@@ -1371,23 +1725,12 @@ R_API int r_anal_fcn_del_locs(RAnal *anal, ut64 addr) {
 
 R_API int r_anal_fcn_del(RAnal *a, ut64 addr) {
 	if (addr == UT64_MAX) {
-#if USE_NEW_FCN_STORE
-		r_listrange_free (a->fcnstore);
-		a->fcnstore = r_listrange_new ();
-#else
 		r_list_free (a->fcns);
+		a->fcn_tree = NULL;
 		if (!(a->fcns = r_anal_fcn_list_new ())) {
 			return false;
 		}
-#endif
 	} else {
-#if USE_NEW_FCN_STORE
-		// XXX: must only get the function if starting at 0?
-		RAnalFunction *f = r_listrange_find_in_range (a->fcnstore, addr);
-		if (f) {
-			r_listrange_del (a->fcnstore, f);
-		}
-#else
 		RAnalFunction *fcni;
 		RListIter *iter, *iter_tmp;
 		r_list_foreach_safe (a->fcns, iter, iter_tmp, fcni) {
@@ -1395,23 +1738,21 @@ R_API int r_anal_fcn_del(RAnal *a, ut64 addr) {
 				if (a->cb.on_fcn_delete) {
 					a->cb.on_fcn_delete (a, a->user, fcni);
 				}
+				r_anal_fcn_tree_delete (&a->fcn_tree, fcni);
+				r_list_delete (a->fcns, iter);
+			} else if (fcni->addr == addr) {
 				r_list_delete (a->fcns, iter);
 			}
 		}
-#endif
 	}
 	return true;
 }
 
 R_API RAnalFunction *r_anal_get_fcn_in(RAnal *anal, ut64 addr, int type) {
-#if USE_NEW_FCN_STORE
-	// TODO: type is ignored here? wtf.. we need more work on fcnstore
-	// if (root) return r_listrange_find_root (anal->fcnstore, addr);
-	return r_listrange_find_in_range (anal->fcnstore, addr);
-#else
+#if 0
+  // Linear scan
 	RAnalFunction *fcn, *ret = NULL;
 	RListIter *iter;
-
 	if (type == R_ANAL_FCN_TYPE_ROOT) {
 		r_list_foreach (anal->fcns, iter, fcn) {
 			if (addr == fcn->addr) {
@@ -1429,6 +1770,22 @@ R_API RAnalFunction *r_anal_get_fcn_in(RAnal *anal, ut64 addr, int type) {
 		}
 	}
 	return ret;
+
+#else
+	// Interval tree query
+	RAnalFunction *fcn;
+	FcnTreeIter it;
+	if (type == R_ANAL_FCN_TYPE_ROOT) {
+		return _fcn_tree_find_addr (anal->fcn_tree, addr);
+	}
+	fcn_tree_foreach_intersect (anal->fcn_tree, it, fcn, addr, addr + 1) {
+		if (!type || (fcn && fcn->type & type)) {
+			if (r_tinyrange_in (&fcn->bbr, addr) || fcn->addr == addr) {
+				return fcn;
+			}
+		}
+	}
+	return NULL;
 #endif
 }
 
@@ -1437,12 +1794,6 @@ R_API bool r_anal_fcn_in(RAnalFunction *fcn, ut64 addr) {
 }
 
 R_API RAnalFunction *r_anal_get_fcn_in_bounds(RAnal *anal, ut64 addr, int type) {
-#if USE_NEW_FCN_STORE
-#warning TODO: r_anal_get_fcn_in_bounds
-	// TODO: type is ignored here? wtf.. we need more work on fcnstore
-	// if (root) return r_listrange_find_root (anal->fcnstore, addr);
-	return r_listrange_find_in_range (anal->fcnstore, addr);
-#else
 	RAnalFunction *fcn, *ret = NULL;
 	RListIter *iter;
 	if (type == R_ANAL_FCN_TYPE_ROOT) {
@@ -1461,7 +1812,6 @@ R_API RAnalFunction *r_anal_get_fcn_in_bounds(RAnal *anal, ut64 addr, int type) 
 		}
 	}
 	return ret;
-#endif
 }
 
 R_API RAnalFunction *r_anal_fcn_find_name(RAnal *anal, const char *name) {
@@ -1480,6 +1830,7 @@ R_API int r_anal_fcn_add_bb(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 siz
 	RAnalBlock *bb = NULL, *bbi;
 	RListIter *iter;
 	bool mid = false;
+	st64 n;
 
 	r_list_foreach (fcn->bbs, iter, bbi) {
 		if (addr == bbi->addr) {
@@ -1524,6 +1875,11 @@ R_API int r_anal_fcn_add_bb(RAnal *anal, RAnalFunction *fcn, ut64 addr, ut64 siz
 		}
 	}
 	r_anal_fcn_update_tinyrange_bbs (fcn);
+	n = bb->addr + bb->size - fcn->addr;
+	if (n >= 0 && r_anal_fcn_size (fcn) < n) {
+		// If fcn is in anal->fcn_tree (which reflects anal->fcns), update fcn_tree because fcn->_size has changed.
+		r_anal_fcn_set_size (anal, fcn, n);
+	}
 	return true;
 }
 
@@ -1661,7 +2017,7 @@ R_API int r_anal_str_to_fcn(RAnal *a, RAnalFunction *f, const char *sig) {
 	/* Add 'function' keyword */
 	char *str = calloc (1, length);
 	if (!str) {
-		eprintf ("Cannot allocate %d bytes\n", length);
+		eprintf ("Cannot allocate %d byte(s)\n", length);
 		return false;
 	}
 	strcpy (str, "function ");
@@ -1676,11 +2032,8 @@ R_API int r_anal_str_to_fcn(RAnal *a, RAnalFunction *f, const char *sig) {
 }
 
 R_API RAnalFunction *r_anal_get_fcn_at(RAnal *anal, ut64 addr, int type) {
-#if USE_NEW_FCN_STORE
-	// TODO: type is ignored here? wtf.. we need more work on fcnstore
-	// if (root) return r_listrange_find_root (anal->fcnstore, addr);
-	return r_listrange_find_root (anal->fcnstore, addr);
-#else
+#if 0
+	// Linear scan
 	RAnalFunction *fcn, *ret = NULL;
 	RListIter *iter;
 	if (type == R_ANAL_FCN_TYPE_ROOT) {
@@ -1699,6 +2052,21 @@ R_API RAnalFunction *r_anal_get_fcn_at(RAnal *anal, ut64 addr, int type) {
 		}
 	}
 	return ret;
+#else
+	// Interval tree query
+	RAnalFunction *fcn;
+	FcnTreeIter it;
+	if (type == R_ANAL_FCN_TYPE_ROOT) {
+		return _fcn_tree_find_addr (anal->fcn_tree, addr);
+	}
+	fcn_tree_foreach_intersect (anal->fcn_tree, it, fcn, addr, addr + 1) {
+		if (!type || (fcn && fcn->type & type)) {
+			if (addr == fcn->addr) {
+				return fcn;
+			}
+		}
+	}
+	return NULL;
 #endif
 }
 
@@ -1714,16 +2082,6 @@ R_API RAnalFunction *r_anal_fcn_next(RAnal *anal, ut64 addr) {
 	}
 	return closer;
 }
-
-/* getters */
-#if FCN_OLD
-R_API RList *r_anal_fcn_get_refs(RAnalFunction *fcn) {
-	return fcn->refs;
-}
-R_API RList *r_anal_fcn_get_xrefs(RAnalFunction *fcn) {
-	return fcn->xrefs;
-}
-#endif
 
 R_API RList *r_anal_fcn_get_bbs(RAnalFunction *anal) {
 	// avoid received to free this thing
@@ -1757,17 +2115,31 @@ R_API int r_anal_fcn_count(RAnal *anal, ut64 from, ut64 to) {
 
 /* return the basic block in fcn found at the given address.
  * NULL is returned if such basic block doesn't exist. */
-R_API RAnalBlock *r_anal_fcn_bbget(RAnalFunction *fcn, ut64 addr) {
+R_API RAnalBlock *r_anal_fcn_bbget_in(RAnalFunction *fcn, ut64 addr) {
+	if (!fcn || addr == UT64_MAX) {
+		return NULL;
+	}
+	RListIter *iter;
+	RAnalBlock *bb;
+	r_list_foreach (fcn->bbs, iter, bb) {
+		if (addr >= bb->addr && addr < (bb->addr + bb->size)) {
+			return bb;
+		}
+	}
+	return NULL;
+}
+
+R_API RAnalBlock *r_anal_fcn_bbget_at(RAnalFunction *fcn, ut64 addr) {
 	if (!fcn || addr == UT64_MAX) {
 		return NULL;
 	}
 #if USE_SDB_CACHE
-	return sdb_ptr_get (HB, sdb_fmt (0, SDB_KEY_BB, fcn->addr, addr), NULL);
+	return sdb_ptr_get (HB, sdb_fmt (SDB_KEY_BB, fcn->addr, addr), NULL);
 #else
 	RListIter *iter;
 	RAnalBlock *bb;
 	r_list_foreach (fcn->bbs, iter, bb) {
-		if (bb->addr == addr) {
+		if (addr == bb->addr) {
 			return bb;
 		}
 	}
@@ -1775,18 +2147,28 @@ R_API RAnalBlock *r_anal_fcn_bbget(RAnalFunction *fcn, ut64 addr) {
 #endif
 }
 
+
 R_API bool r_anal_fcn_bbadd(RAnalFunction *fcn, RAnalBlock *bb) {
 #if USE_SDB_CACHE
-	return sdb_ptr_set (HB, sdb_fmt (0, SDB_KEY_BB, fcn->addr, bb->addr), bb, NULL);
+	return sdb_ptr_set (HB, sdb_fmt (SDB_KEY_BB, fcn->addr, bb->addr), bb, NULL);
 #endif
 	r_list_append (fcn->bbs, bb);
 	return true;
 }
 
-/* directly set the size of the function */
-R_API void r_anal_fcn_set_size(RAnalFunction *fcn, ut32 size) {
-	if (fcn) {
-		fcn->_size = size;
+
+/* directly set the size of the function
+ * if fcn is in ana RAnal's fcn_tree, the anal MUST be passed,
+ * otherwise it can be NULL */
+R_API void r_anal_fcn_set_size(const RAnal *anal, RAnalFunction *fcn, ut32 size) {
+	if (!fcn) {
+		return;
+	}
+
+	fcn->_size = size;
+
+	if (anal) {
+		_fcn_tree_update_size (anal->fcn_tree, fcn);
 	}
 }
 
@@ -1844,11 +2226,11 @@ R_API ut32 r_anal_fcn_cost(RAnal *anal, RAnalFunction *fcn) {
 		RAnalOp op;
 		ut64 at, end = bb->addr + bb->size;
 		ut8 *buf = malloc (bb->size);
-		anal->iob.read_at (anal->iob.io, bb->addr, (ut8 *) buf, bb->size);
+		(void)anal->iob.read_at (anal->iob.io, bb->addr, (ut8 *) buf, bb->size);
 		int idx = 0;
 		for (at = bb->addr; at < end;) {
 			memset (&op, 0, sizeof (op));
-			(void) r_anal_op (anal, &op, at, buf + idx, bb->size - idx);
+			(void) r_anal_op (anal, &op, at, buf + idx, bb->size - idx, R_ANAL_OP_MASK_BASIC);
 			if (op.size < 1) {
 				op.size = 1;
 			}

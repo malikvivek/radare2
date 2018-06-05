@@ -45,7 +45,7 @@ static int r_debug_gdb_reg_read(RDebug *dbg, int type, ut8 *buf, int size) {
 	int buflen = 0;
 	check_connection (dbg);
 	gdbr_read_registers (desc);
-	if (!desc) {
+	if (!desc || !desc->data) {
 		return -1;
 	}
 	// read the len of the current area
@@ -124,7 +124,14 @@ static RList *r_debug_gdb_map_get(RDebug* dbg) { //TODO
 	ut64 buflen = 16384;
 	// If /proc/%d/maps is not valid for gdbserver, we return NULL, as of now
 	snprintf (path, sizeof (path) - 1, "/proc/%d/maps", desc->pid);
-	if (gdbr_open_file (desc, path, O_RDONLY, S_IRUSR | S_IWUSR | S_IXUSR) < 0) {
+
+#ifdef _MSC_VER
+#define GDB_FILE_OPEN_MODE (_S_IREAD | _S_IWRITE)
+#else
+#define GDB_FILE_OPEN_MODE (S_IRUSR | S_IWUSR | S_IXUSR)
+#endif
+
+	if (gdbr_open_file (desc, path, O_RDONLY, GDB_FILE_OPEN_MODE) < 0) {
 		return NULL;
 	}
 	if (!(buf = malloc (buflen))) {
@@ -301,9 +308,9 @@ static int r_debug_gdb_continue(RDebug *dbg, int pid, int tid, int sig) {
 	check_connection (dbg);
 	gdbr_continue (desc, pid, -1, sig); // Continue all threads
 	if (desc->stop_reason.is_valid && desc->stop_reason.thread.present) {
-		if (desc->tid != desc->stop_reason.thread.tid) {
-			eprintf ("= attach %d %d\n", dbg->pid, dbg->tid);
-		}
+		//if (desc->tid != desc->stop_reason.thread.tid) {
+		//	eprintf ("thread id (%d) in reason differs from current thread id (%d)\n", dbg->pid, dbg->tid);
+		//}
 		desc->tid = desc->stop_reason.thread.tid;
 	}
 	return desc->tid;
@@ -322,7 +329,7 @@ static RDebugReasonType r_debug_gdb_wait(RDebug *dbg, int pid) {
 		dbg->pid = desc->stop_reason.thread.pid;
 		dbg->tid = desc->stop_reason.thread.tid;
 		if (dbg->pid != desc->pid || dbg->tid != desc->tid) {
-			eprintf ("= attach %d %d\n", dbg->pid, dbg->tid);
+			//eprintf ("= attach %d %d\n", dbg->pid, dbg->tid);
 			gdbr_select (desc, dbg->pid, dbg->tid);
 		}
 	}

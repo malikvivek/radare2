@@ -14,6 +14,13 @@
 #define st8 signed char
 #define boolt int
 
+typedef union {
+	ut8 v8;
+	ut16 v16;
+	ut32 v32;
+	ut64 v64;
+} utAny;
+
 typedef struct _ut80 {
 	ut64 Low;
 	ut16 High;
@@ -136,6 +143,13 @@ typedef struct _utX{
 #undef NAN
 #elif defined(__GNUC__) || defined(__TINYC__)
 #define R_PACKED( __Declaration__ ) __Declaration__ __attribute__((__packed__))
+#endif
+
+#if APPLE_SDK_IPHONESIMULATOR
+#undef LIBC_HAVE_FORK
+#define LIBC_HAVE_FORK 0
+#undef DEBUGGER
+#define DEBUGGER 0
 #endif
 
 #endif // R2_TYPES_BASE_H

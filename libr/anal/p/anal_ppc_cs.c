@@ -1,4 +1,4 @@
-/* radare2 - LGPL - Copyright 2013-2017 - pancake */
+/* radare2 - LGPL - Copyright 2013-2018 - pancake */
 
 #include <r_anal.h>
 #include <r_lib.h>
@@ -19,7 +19,6 @@ struct Getarg {
 	int bits;
 };
 
-#define esilprintf(op, fmt, ...) r_strbuf_appendf (&op->esil, fmt, ##__VA_ARGS__)
 #define INSOPS insn->detail->ppc.op_count
 #define INSOP(n) insn->detail->ppc.operands[n]
 #define IMM(x) (ut64)(insn->detail->ppc.operands[x].imm)
@@ -34,7 +33,6 @@ static ut64 mask64(ut64 mb, ut64 me) {
 	if (mb > 63 || me > 63) {
 		return mask;
 	}
-
 	if (mb < (me + 1)) {
 		for (i = mb; i <= me; i++) {
 			mask = mask | (ut64) (1LL << (63 - i));
@@ -543,6 +541,51 @@ static int analop_vle(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len)
 	return -1;
 }
 
+#define ZERO_FILL(x) memset (&x, 0, sizeof (x))
+
+static int parse_reg_name(RRegItem *reg, csh handle, cs_insn *insn, int reg_num) {
+	if (!reg) {
+		return -1;
+	}
+	switch (INSOP (reg_num).type) {
+	case PPC_OP_REG:
+		reg->name = (char *)cs_reg_name (handle, INSOP (reg_num).reg);
+		break;
+	case PPC_OP_MEM:
+		if (INSOP (reg_num).mem.base != PPC_REG_INVALID) {
+			reg->name = (char *)cs_reg_name (handle, INSOP (reg_num).mem.base);
+		}
+		break;
+	default :
+		break;
+	}
+	return 0;
+}
+
+static void op_fillval(RAnalOp *op, csh handle, cs_insn *insn) {
+	static RRegItem reg;
+	switch (op->type) {
+	case R_ANAL_OP_TYPE_LOAD:
+		if (INSOP(1).type == PPC_OP_MEM) {
+			ZERO_FILL (reg);
+			op->src[0] = r_anal_value_new ();
+			op->src[0]->reg = &reg;
+			parse_reg_name (op->src[0]->reg, handle, insn, 1);
+			op->src[0]->delta = INSOP(1).mem.disp;
+		}
+		break;
+	case R_ANAL_OP_TYPE_STORE:
+		if (INSOP(1).type == PPC_OP_MEM) {
+			ZERO_FILL (reg);
+			op->dst = r_anal_value_new ();
+			op->dst->reg = &reg;
+			parse_reg_name (op->dst->reg, handle, insn, 1);
+			op->dst->delta = INSOP(1).mem.disp;
+		}
+		break;
+	}
+}
+
 static int analop(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len) {
 	static csh handle = 0;
 	static int omode = -1, obits = -1;
@@ -633,7 +676,7 @@ static int analop(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len) {
 			break;
 		case PPC_INS_CLRLWI:
 			op->type = R_ANAL_OP_TYPE_AND;
-			esilprintf (op, "%s,%s,&,%s,=", ARG (1), (ut64) cmask32 (ARG (2), "0x1F"), ARG (0));
+			esilprintf (op, "%s,%s,&,%s,=", ARG (1), cmask32 (ARG (2), "0x1F"), ARG (0));
 			break;
 		case PPC_INS_RLWINM:
 			op->type = R_ANAL_OP_TYPE_ROL;
@@ -1136,6 +1179,9 @@ static int analop(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len) {
 			esilprintf (op, "%s,%s,<<<,%s,&,%s,=", ARG (2), ARG (1), cmask64 (0, ARG (3)), ARG (0));
 			break;
 		}
+		if (a->fillval) {
+			op_fillval (op, handle, insn);
+		}
 		r_strbuf_fini (&op->esil);
 		cs_free (insn, n);
 		//cs_close (&handle);
@@ -1143,8 +1189,11 @@ static int analop(RAnal *a, RAnalOp *op, ut64 addr, const ut8 *buf, int len) {
 	return op->size;
 }
 
-static int archinfo(RAnal *anal, int q) {
-	return 2; /* :D */
+static int archinfo(RAnal *a, int q) {
+	if (a->cpu && !strncmp (a->cpu, "vle", 3)) {
+		return 2;
+	}
+	return 4;
 }
 
 RAnalPlugin r_anal_plugin_ppc_cs = {

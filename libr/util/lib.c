@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2008-2016 - pancake */
+/* radare - LGPL - Copyright 2008-2018 - pancake */
 
 #include "r_types.h"
 #include "r_util.h"
@@ -11,7 +11,7 @@ R_LIB_VERSION(r_lib);
 
 #if __UNIX__
 #include <dlfcn.h>
-  #define DLOPEN(x)  dlopen(x, RTLD_LOCAL | RTLD_NOW)
+  #define DLOPEN(x)  dlopen(x, RTLD_GLOBAL | RTLD_LAZY)
   #define DLSYM(x,y) dlsym(x,y)
   #define DLCLOSE(x) dlclose(x)
 #elif __WINDOWS__
@@ -407,7 +407,7 @@ R_API int r_lib_opendir(RLib *lib, const char *path) {
 	return true;
 }
 
-R_API int r_lib_add_handler(RLib *lib,
+R_API bool r_lib_add_handler(RLib *lib,
 	int type, const char *desc,
 	int (*cb)(RLibPlugin *, void *, void *),  /* constructor */
 	int (*dt)(RLibPlugin *, void *, void *),  /* destructor */
@@ -439,7 +439,7 @@ R_API int r_lib_add_handler(RLib *lib,
 	return true;
 }
 
-R_API int r_lib_del_handler(RLib *lib, int type) {
+R_API bool r_lib_del_handler(RLib *lib, int type) {
 	RLibHandler *h;
 	RListIter *iter;
 	// TODO: remove all handlers for that type? or only one?

@@ -584,8 +584,6 @@ static int module_match_buffer(const RAnal *anal, const RFlirtModule *module,
 				r_list_foreach_safe (anal->fcns, iter, iter_tmp, fcn) {
 					if (fcn->addr >= next_module_function->addr + next_module_function_size &&
 					fcn->addr < next_module_function->addr + flirt_fcn_size) {
-						r_list_join (next_module_function->refs, fcn->refs);
-						r_list_join (next_module_function->xrefs, fcn->xrefs);
 						r_list_join (next_module_function->bbs, fcn->bbs);
 						r_list_join (next_module_function->locs, fcn->locs);
 						// r_list_join (next_module_function->vars, r_anal_var_all_list (anal, fcn);
@@ -593,9 +591,9 @@ static int module_match_buffer(const RAnal *anal, const RFlirtModule *module,
 						r_anal_fcn_del ((RAnal *) anal, fcn->addr);
 					}
 				}
-				r_anal_fcn_resize (next_module_function, flirt_fcn_size);
+				r_anal_fcn_resize (anal, next_module_function, flirt_fcn_size);
 				next_module_function_size = r_anal_fcn_size (next_module_function);
-				r_anal_trim_jmprefs (next_module_function);
+				r_anal_trim_jmprefs ((RAnal *)anal, next_module_function);
 			}
 
 

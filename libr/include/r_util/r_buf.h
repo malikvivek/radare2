@@ -19,6 +19,13 @@ typedef struct r_buf_t {
 	int fd;
 	int Oxff;
 	RList *sparse;
+	int refctr;
+	// RIOBind *iob;
+	// forward declaration
+	void *iob;
+	ut64 offset;
+	ut64 limit;
+	struct r_buf_t * parent;
 } RBuffer;
 
 typedef struct r_buf_cache_t {
@@ -32,6 +39,7 @@ typedef struct r_buf_cache_t {
 
 /* constructors */
 R_API RBuffer *r_buf_new(void);
+R_API RBuffer *r_buf_new_with_io(void *iob, int fd);
 R_API RBuffer *r_buf_new_with_bytes(const ut8* bytes, ut64 len);
 R_API RBuffer *r_buf_new_with_string (const char *msg);
 R_API RBuffer *r_buf_new_with_pointers(const ut8 *bytes, ut64 len);
@@ -41,7 +49,9 @@ R_API RBuffer *r_buf_new_slurp(const char *file);
 R_API RBuffer *r_buf_new_empty (ut64 len);
 R_API RBuffer *r_buf_mmap(const char *file, int flags);
 R_API RBuffer *r_buf_new_sparse(ut8 Oxff);
+R_API RBuffer *r_buf_new_slice(RBuffer *b, ut64 offset, ut64 size);
 R_API bool r_buf_dump (RBuffer *buf, const char *file);
+R_API RBuffer *r_buf_ref(RBuffer *b);
 /* methods */
 R_API bool r_buf_set_bits(RBuffer *b, ut64 at, const ut8* buf, int bitoff, int count);
 R_API int r_buf_set_bytes(RBuffer *b, const ut8 *buf, ut64 length);

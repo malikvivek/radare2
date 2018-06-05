@@ -1,4 +1,4 @@
-/* radare2 - LGPL - Copyright 2008-2017 - pancake, Jody Frankowski */
+/* radare2 - LGPL - Copyright 2008-2018 - pancake, Jody Frankowski */
 
 #include <r_cons.h>
 #include <r_print.h>
@@ -15,7 +15,7 @@
 
 R_LIB_VERSION (r_cons);
 
-static RCons r_cons_instance;
+static RCons r_cons_instance = {{{{0}}}};
 #define I r_cons_instance
 
 //this structure goes into cons_stack when r_cons_push/pop
@@ -71,67 +71,33 @@ static inline void r_cons_write(const char *buf, int len) {
 #endif
 }
 
-R_API char *r_cons_color_random_string(int bg) {
-	int r, g, b;
-	if (I.truecolor > 0) {
-		char out[32];
-		r = r_num_rand (0xff);
-		g = r_num_rand (0xff);
-		b = r_num_rand (0xff);
-		r_cons_rgb_str (out, r, g, b, bg);
-		return strdup (out);
+R_API RColor r_cons_color_random(ut8 alpha) {
+	RColor rcolor = {0};
+	if (I.color > COLOR_MODE_16) {
+		rcolor.r = r_num_rand (0xff);
+		rcolor.g = r_num_rand (0xff);
+		rcolor.b = r_num_rand (0xff);
+		rcolor.a = alpha;
+		return rcolor;
 	}
-	// random ansi
-	const char *color = "white";
-	r = r_num_rand (8);
+	int r = r_num_rand (16);
 	switch (r) {
-	case 0: color = "red"; break;
-	case 1: color = "white"; break;
-	case 2: color = "green"; break;
-	case 3: color = "magenta"; break;
-	case 4: color = "yellow"; break;
-	case 5: color = "cyan"; break;
-	case 6: color = "blue"; break;
-	case 7: color = "gray"; break;
+	case 0: case 1: rcolor = (RColor) RColor_RED; break;
+	case 2: case 3: rcolor = (RColor) RColor_WHITE; break;
+	case 4: case 5: rcolor = (RColor) RColor_GREEN; break;
+	case 6: case 7: rcolor = (RColor) RColor_MAGENTA; break;
+	case 8: case 9: rcolor = (RColor) RColor_YELLOW; break;
+	case 10: case 11: rcolor = (RColor) RColor_CYAN; break;
+	case 12: case 13: rcolor = (RColor) RColor_BLUE; break;
+	case 14: case 15: rcolor = (RColor) RColor_GRAY; break;
 	}
-	return strdup (color);
+	if (r & 1) {
+		rcolor.attr = R_CONS_ATTR_BOLD;
+	}
+	return rcolor;
 }
 
-R_API char *r_cons_color_random(int bg) {
-	int r, g, b;
-	if (I.truecolor > 0) {
-		char out[32];
-		r = r_num_rand (0xff);
-		g = r_num_rand (0xff);
-		b = r_num_rand (0xff);
-		r_cons_rgb_str (out, r, g, b, bg);
-		return strdup (out);
-	}
-	const char *color = Color_RESET;
-	// random ansi
-	r = r_num_rand (16);
-	switch (r) {
-	case 0: color = Color_RED; break;
-	case 1: color = Color_BRED; break;
-	case 2: color = Color_WHITE; break;
-	case 3: color = Color_BWHITE; break;
-	case 4: color = Color_GREEN; break;
-	case 5: color = Color_BGREEN; break;
-	case 6: color = Color_MAGENTA; break;
-	case 7: color = Color_BMAGENTA; break;
-	case 8: color = Color_YELLOW; break;
-	case 9: color = Color_BYELLOW; break;
-	case 10: color = Color_CYAN; break;
-	case 11: color = Color_BCYAN; break;
-	case 12: color = Color_BLUE; break;
-	case 13: color = Color_BBLUE; break;
-	case 14: color = Color_GRAY; break;
-	case 15: color = Color_BGRAY; break;
-	}
-	return strdup (color);
-}
-
-R_API void r_cons_color (int fg, int r, int g, int b) {
+R_API void r_cons_color(int fg, int r, int g, int b) {
 	int k;
 	r = R_DIM (r, 0, 255);
 	g = R_DIM (g, 0, 255);
@@ -155,7 +121,7 @@ R_API void r_cons_println(const char* str) {
 R_API void r_cons_strcat_justify(const char *str, int j, char c) {
 	int i, o, len;
 	for (o = i = len = 0; str[i]; i++, len++) {
-		if (str[i]=='\n') {
+		if (str[i] == '\n') {
 			r_cons_memset (' ', j);
 			if (c) {
 				r_cons_memset (c, 1);
@@ -174,7 +140,7 @@ R_API void r_cons_strcat_justify(const char *str, int j, char c) {
 	}
 }
 
-R_API RCons *r_cons_singleton () {
+R_API RCons *r_cons_singleton() {
 	return &I;
 }
 
@@ -224,6 +190,9 @@ R_API void r_cons_break_pop() {
 }
 
 R_API bool r_cons_is_breaked() {
+	if (I.cb_break) {
+		I.cb_break (I.user);
+	}
 	if (I.timeout) {
 		if (r_sys_now () > I.timeout) {
 			I.breaked = true;
@@ -274,7 +243,7 @@ static BOOL __w32_control(DWORD type) {
 	return false;
 }
 #elif __UNIX__ || __CYGWIN__
-static void resize (int sig) {
+static void resize(int sig) {
 	if (I.event_resize) {
 		I.event_resize (I.event_data);
 	}
@@ -295,14 +264,6 @@ R_API bool r_cons_enable_mouse(const bool enable) {
 #endif
 }
 
-static void r_cons_pal_null() {
-	int i;
-	RCons *cons = r_cons_singleton ();
-	for (i = 0; i < R_CONS_PALETTE_LIST_SIZE; i++){
-		cons->pal.list[i] = NULL;
-	}
-}
-
 R_API RCons *r_cons_new() {
 	I.refcnt++;
 	if (I.refcnt != 1) {
@@ -314,7 +275,7 @@ R_API RCons *r_cons_new() {
 	I.event_interrupt = NULL;
 	I.is_wine = -1;
 	I.fps = 0;
-	I.use_color = false;
+	I.color = COLOR_MODE_DISABLED;
 	I.blankline = true;
 	I.teefile = NULL;
 	I.fix_columns = 0;
@@ -332,7 +293,7 @@ R_API RCons *r_cons_new() {
 	I.fdout = 1;
 	I.breaked = false;
 	I.break_lines = false;
-	//I.lines = 0;
+	I.lines = 0;
 	I.buffer = NULL;
 	I.buffer_sz = 0;
 	I.buffer_len = 0;
@@ -362,14 +323,12 @@ R_API RCons *r_cons_new() {
 	}
 #endif
 	I.pager = NULL; /* no pager by default */
-	I.truecolor = 0;
 	I.mouse = 0;
 	I.cons_stack = r_stack_newf (6, cons_stack_free);
 	I.break_stack = r_stack_newf (6, break_stack_free);
-	r_cons_pal_null ();
-	r_cons_pal_init (NULL);
-	r_cons_rgb_init ();
 	r_cons_reset ();
+	r_cons_rgb_init ();
+	r_cons_pal_init ();
 	return &I;
 }
 
@@ -466,7 +425,7 @@ R_API void r_cons_clear_line(int std_err) {
 	} else {
 		char white[1024];
 		memset (&white, ' ', sizeof (white));
-		if (I.columns > 0 && I.columns < sizeof(white)) {
+		if (I.columns > 0 && I.columns < sizeof (white)) {
 			white[I.columns - 1] = 0;
 		} else if (I.columns == 0) {
 			white[0] = 0;
@@ -632,7 +591,7 @@ R_API void r_cons_flush() {
 			}
 #endif
 			// fix | more | less problem
-			r_cons_set_raw (1);
+			r_cons_set_raw (true);
 		}
 	}
 	if (tee && *tee) {
@@ -706,7 +665,7 @@ R_API void r_cons_visual_flush() {
 		fps = 0;
 		if (prev) {
 			ut64 now = r_sys_now ();
-			ut64 diff = now - prev;
+			st64 diff = (st64)(now - prev);
 			if (diff < 0) {
 				fps = 0;
 			} else {
@@ -724,13 +683,13 @@ static int real_strlen(const char *ptr, int len) {
 	int utf8len = r_str_len_utf8 (ptr);
 	int ansilen = r_str_ansi_len (ptr);
 	int diff = len - utf8len;
-	if (diff) {
+	if (diff > 0) {
 		diff--;
 	}
 	return ansilen - diff;
 }
 
-R_API void r_cons_visual_write (char *buffer) {
+R_API void r_cons_visual_write(char *buffer) {
 	char white[1024];
 	int cols = I.columns;
 	int alen, plen, lines = I.rows;
@@ -1053,7 +1012,7 @@ R_API int r_cons_get_size(int *rows) {
 	return R_MAX (0, I.columns);
 }
 
-R_API void r_cons_show_cursor (int cursor) {
+R_API void r_cons_show_cursor(int cursor) {
 #if __WINDOWS__ && !__CYGWIN__
 	// TODO
 #else
@@ -1078,7 +1037,7 @@ R_API void r_cons_show_cursor (int cursor) {
  *
  */
 static int oldraw = -1;
-R_API void r_cons_set_raw(int is_raw) {
+R_API void r_cons_set_raw(bool is_raw) {
 	if (oldraw != -1) {
 		if (is_raw == oldraw) {
 			return;
@@ -1088,8 +1047,8 @@ R_API void r_cons_set_raw(int is_raw) {
 	/* do nothing here */
 #elif __UNIX__ || __CYGWIN__
 	// enforce echo off
-	I.term_raw.c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
 	if (is_raw) {
+		I.term_raw.c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
 		tcsetattr (0, TCSANOW, &I.term_raw);
 	} else {
 		tcsetattr (0, TCSANOW, &I.term_buf);
@@ -1166,7 +1125,7 @@ R_API void r_cons_column(int c) {
 
 static int lasti = 0; /* last interactive mode */
 
-R_API void r_cons_set_interactive(int x) {
+R_API void r_cons_set_interactive(bool x) {
 	lasti = r_cons_singleton ()->is_interactive;
 	r_cons_singleton ()->is_interactive = x;
 }
@@ -1186,9 +1145,9 @@ R_API void r_cons_zero() {
 	write (1, "", 1);
 }
 
-R_API void r_cons_highlight (const char *word) {
-	int l, *cpos;
-	char *rword, *res, *clean;
+R_API void r_cons_highlight(const char *word) {
+	int l, *cpos = NULL;
+	char *rword = NULL, *res, *clean = NULL;
 	char *inv[2] = {
 		R_CONS_INVERT (true, true),
 		R_CONS_INVERT (false, true)
@@ -1201,8 +1160,8 @@ R_API void r_cons_highlight (const char *word) {
 	if (word && *word && I.buffer) {
 		int word_len = strlen (word);
 		char *orig;
-		clean = I.buffer;
-		l = r_str_ansi_filter (clean, &orig, &cpos, 0);
+		clean = r_str_ndup (I.buffer, I.buffer_len);
+		l = r_str_ansi_filter (clean, &orig, &cpos, -1);
 		I.buffer = orig;
 		if (I.highlight) {
 			if (strcmp (word, I.highlight)) {
@@ -1215,6 +1174,7 @@ R_API void r_cons_highlight (const char *word) {
 		rword = malloc (word_len + linv[0] + linv[1] + 1);
 		if (!rword) {
 			free (cpos);
+			free (clean);
 			return;
 		}
 		strcpy (rword, inv[0]);
@@ -1237,7 +1197,7 @@ R_API void r_cons_highlight (const char *word) {
 	}
 }
 
-R_API char *r_cons_lastline (int *len) {
+R_API char *r_cons_lastline(int *len) {
 	char *b = I.buffer + I.buffer_len;
 	while (b > I.buffer) {
 		if (*b == '\n') {
@@ -1250,6 +1210,47 @@ R_API char *r_cons_lastline (int *len) {
 		int delta = b - I.buffer;
 		*len = I.buffer_len - delta;
 	}
+	return b;
+}
+
+// same as r_cons_lastline(), but len will be the number of
+// utf-8 characters excluding ansi escape sequences as opposed to just bytes
+R_API char *r_cons_lastline_utf8_ansi_len(int *len) {
+	if (!len) {
+		return r_cons_lastline (0);
+	}
+
+	char *b = I.buffer + I.buffer_len;
+	int l = 0;
+	int last_possible_ansi_end = 0;
+	char ch = '\0';
+	char ch2;
+	while (b > I.buffer) {
+		ch2 = ch;
+		ch = *b;
+
+		if (ch == '\n') {
+			b++;
+			l--;
+			break;
+		}
+
+		// utf-8
+		if ((ch & 0xc0) != 0x80) {
+			l++;
+		}
+
+		// ansi
+		if (ch == 'J' || ch == 'm' || ch == 'H') {
+			last_possible_ansi_end = l - 1;
+		} else if (ch == '\x1b' && ch2 == '[') {
+			l = last_possible_ansi_end;
+		}
+
+		b--;
+	}
+
+	*len = l;
 	return b;
 }
 
@@ -1274,7 +1275,7 @@ R_API char *r_cons_swap_ground(const char *col) {
 	return strdup (col);
 }
 
-R_API bool r_cons_drop (int n) {
+R_API bool r_cons_drop(int n) {
 	if (n > I.buffer_len) {
 		I.buffer_len = 0;
 		return false;
@@ -1283,7 +1284,7 @@ R_API bool r_cons_drop (int n) {
 	return true;
 }
 
-R_API void r_cons_chop () {
+R_API void r_cons_chop() {
 	while (I.buffer_len > 0) {
 		char ch = I.buffer[I.buffer_len - 1];
 		if (ch != '\n' && !IS_WHITESPACE (ch)) {
@@ -1353,7 +1354,7 @@ R_API void r_cons_cmd_help(const char *help[], bool use_color) {
 	for (i = 0; help[i]; i += 3) {
 		if (i) {
 			int padding = max_length - (strlen (help[i]) + strlen (help[i + 1]));
-			r_cons_printf("| %s%s%s%*s  %s%s%s\n",
+			r_cons_printf ("| %s%s%s%*s  %s%s%s\n",
 					help[i],
 					pal_args_color, help[i + 1],
 					padding, "",

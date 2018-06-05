@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2009-2016 nibble, pancake */
+/* radare - LGPL - Copyright 2009-2018 nibble, pancake */
 
 #include <r_types.h>
 #include <r_util.h>
@@ -14,7 +14,7 @@ static RList * oneshotall(RBin *bin, const ut8 *buf, ut64 size);
 static int free_xtr (void *xtr_obj);
 
 static bool check_bytes(const ut8* buf, ut64 sz) {
-	return (buf && sz > 3 && !memcmp (buf, "\x64\x79\x6c\x64", 4));
+	return buf && sz > 3 && !memcmp (buf, "dyld", 4);
 }
 
 // TODO: destroy must be void?
@@ -167,8 +167,8 @@ static RList * oneshotall(RBin *bin, const ut8* buf, ut64 size) {
 	return res;
 }
 
-struct r_bin_xtr_plugin_t r_bin_xtr_plugin_xtr_dyldcache = {
-	.name = "xtr_dyldcache",
+RBinXtrPlugin r_bin_xtr_plugin_xtr_dyldcache = {
+	.name = "xtr.dyldcache",
 	.desc = "dyld cache bin extractor plugin",
 	.license = "LGPL3",
 	.load = &load,
@@ -184,7 +184,7 @@ struct r_bin_xtr_plugin_t r_bin_xtr_plugin_xtr_dyldcache = {
 #ifndef CORELIB
 RLibStruct radare_plugin = {
 	.type = R_LIB_TYPE_BIN_XTR,
-	.data = &r_bin_xtr_plugin_xtr_dyldcache,
+	.data = &r_bin_xtr_plugin_dyldcache,
 	.version = R2_VERSION
 };
 #endif

@@ -39,8 +39,16 @@ typedef struct {
 
 typedef struct {
 	RCore *core;
-	const char* input;
+	char* input;
 } RapThread;
+
+R_API void r_core_wait(RCore *core) {
+	r_cons_singleton () -> breaked = true;
+	r_th_kill (httpthread, true);
+	r_th_kill (rapthread, true);
+	r_th_wait (httpthread);
+	r_th_wait (rapthread);
+}
 
 static void http_logf(RCore *core, const char *fmt, ...) {
 	bool http_log_enabled = r_config_get_i (core->config, "http.log");
@@ -334,7 +342,7 @@ R_API int r_core_rtr_http_stop(RCore *u) {
 	RSocket* sock;
 
 #if __WINDOWS__
-	r_socket_http_server_set_breaked (&r_cons_singleton()->breaked);
+	r_socket_http_server_set_breaked (&r_cons_singleton ()->breaked);
 #endif
 	if (((size_t)u) > 0xff) {
 		port = listenport? listenport: r_config_get (
@@ -468,12 +476,12 @@ static int r_core_rtr_http_run(RCore *core, int launch, const char *path) {
 	newcfg = r_config_clone (core->config);
 	core->config = newcfg;
 
-	r_config_set (core->config, "asm.cmtright", "false");
+	r_config_set (core->config, "asm.cmt.right", "false");
 #if 0
 	// WHY
 	r_config_set (core->config, "scr.html", "true");
 #endif
-	r_config_set (core->config, "scr.color", "false");
+	r_config_set_i (core->config, "scr.color", COLOR_MODE_DISABLED);
 	r_config_set (core->config, "asm.bytes", "false");
 	r_config_set (core->config, "scr.interactive", "false");
 	bool restoreSandbox = false;
@@ -501,7 +509,7 @@ static int r_core_rtr_http_run(RCore *core, int launch, const char *path) {
 		/* restore environment */
 		core->config = origcfg;
 		r_config_set (origcfg, "scr.html", r_config_get (origcfg, "scr.html"));
-		r_config_set (origcfg, "scr.color", r_config_get (origcfg, "scr.color"));
+		r_config_set_i (origcfg, "scr.color", r_config_get_i (origcfg, "scr.color"));
 		r_config_set (origcfg, "scr.interactive", r_config_get (origcfg, "scr.interactive"));
 		core->http_up = 0; // DAT IS NOT TRUE AT ALL.. but its the way to enable visual
 
@@ -530,7 +538,7 @@ static int r_core_rtr_http_run(RCore *core, int launch, const char *path) {
 		core->http_up = 1;
 		core->config = newcfg;
 		r_config_set (newcfg, "scr.html", r_config_get (newcfg, "scr.html"));
-		r_config_set (newcfg, "scr.color", r_config_get (newcfg, "scr.color"));
+		r_config_set_i (newcfg, "scr.color", r_config_get_i (newcfg, "scr.color"));
 		r_config_set (newcfg, "scr.interactive", r_config_get (newcfg, "scr.interactive"));
 
 
@@ -789,7 +797,7 @@ static int r_core_rtr_http_run(RCore *core, int launch, const char *path) {
 						r_file_dump (filename, ret, retlen, 0);
 						free (filename);
 						snprintf (buf, sizeof (buf),
-							"<html><body><h2>uploaded %d bytes. Thanks</h2>\n", retlen);
+							"<html><body><h2>uploaded %d byte(s). Thanks</h2>\n", retlen);
 							r_socket_http_response (rs, 200, buf, 0, headers);
 					}
 					free (ret);
@@ -828,7 +836,7 @@ the_end:
 	}
 	/* refresh settings - run callbacks */
 	r_config_set (origcfg, "scr.html", r_config_get (origcfg, "scr.html"));
-	r_config_set (origcfg, "scr.color", r_config_get (origcfg, "scr.color"));
+	r_config_set_i (origcfg, "scr.color", r_config_get_i (origcfg, "scr.color"));
 	r_config_set (origcfg, "scr.interactive", r_config_get (origcfg, "scr.interactive"));
 	return ret;
 }
@@ -880,7 +888,7 @@ R_API int r_core_rtr_http(RCore *core, int launch, const char *path) {
 			eprintf ("TODO: Use different eval environ for scr. for the web\n");
 			eprintf ("TODO: Visual mode should be enabled on local\n");
 		} else {
-			const char *tpath = r_str_trim_const (path + 1);
+			const char *tpath = r_str_trim_ro (path + 1);
 			//HttpThread ht = { core, launch, strdup (tpath) };
 			HttpThread *ht = calloc (sizeof (HttpThread), 1);
 			ht->core = core;
@@ -951,7 +959,7 @@ static int write_big_reg(char *buf, ut64 sz, const utX *val, int regsize, bool b
 				 r_swap_ut64 (val->v128.Low),
 				 r_swap_ut64 (val->v128.High));
 	default:
-		eprintf ("%s: big registers (%d bytes) not yet supported\n",
+		eprintf ("%s: big registers (%d byte(s)) not yet supported\n",
 			 __func__, regsize);
 		return -1;
 	}
@@ -998,7 +1006,7 @@ static int swap_big_regs (char *dest, ut64 sz, const char *src, int regsz) {
 		return snprintf (dest, sz, "0x%016"PFMT64x"%016"PFMT64x,
 				 val.v128.High, val.v128.Low);
 	default:
-		eprintf ("%s: big registers (%d bytes) not yet supported\n",
+		eprintf ("%s: big registers (%d byte(s)) not yet supported\n",
 			 __func__, regsz);
 		return -1;
 	}
@@ -1214,7 +1222,6 @@ static int r_core_rtr_gdb_run(RCore *core, int launch, const char *path) {
 	char port[10];
 	char *file = NULL, *args = NULL;
 	libgdbr_t *g;
-	RCoreFile *cf;
 
 	if (!core || !path) {
 		return -1;
@@ -1223,7 +1230,7 @@ static int r_core_rtr_gdb_run(RCore *core, int launch, const char *path) {
 		debug_msg = true;
 		path++;
 	}
-	if (!(path = r_str_chop_ro (path)) || !*path) {
+	if (!(path = r_str_trim_ro (path)) || !*path) {
 		eprintf ("gdbserver: Port not specified\n");
 		return -1;
 	}
@@ -1236,21 +1243,21 @@ static int r_core_rtr_gdb_run(RCore *core, int launch, const char *path) {
 		eprintf ("gdbserver: File not specified\n");
 		return -1;
 	}
-	if (!(file = (char *)r_str_chop_ro (file)) || !*file) {
+	if (!(file = (char *)r_str_trim_ro (file)) || !*file) {
 		eprintf ("gdbserver: File not specified\n");
 		return -1;
 	}
 	args = strchr (file, ' ');
 	if (args) {
 		*args++ = '\0';
-		if (!(args = (char *)r_str_chop_ro (args))) {
+		if (!(args = (char *)r_str_trim_ro (args))) {
 			args = "";
 		}
 	} else {
 		args = "";
 	}
 
-	if (!(cf = r_core_file_open (core, file, R_IO_READ, 0))) {
+	if (!r_core_file_open (core, file, R_IO_READ, 0)) {
 		eprintf ("Cannot open file (%s)\n", file);
 		return -1;
 	}
@@ -1393,7 +1400,7 @@ R_API void r_core_rtr_add(RCore *core, const char *_input) {
 		proto = RTR_PROT_RAP;
 		host = input;
 	}
-	while (*host && ISWHITECHAR (*host))
+	while (*host && IS_WHITECHAR (*host))
 		host++;
 
 	if (!(ptr = strchr (host, ':'))) {
@@ -1409,7 +1416,7 @@ R_API void r_core_rtr_add(RCore *core, const char *_input) {
 		return;
 	}
 	*file++ = 0;
-	port = r_str_chop (port);
+	port = r_str_trim (port);
 	while (*file == ' ') {
 		file++;
 	}
@@ -1565,7 +1572,7 @@ R_API void r_core_rtr_add(RCore *core, const char *_input) {
 			continue;
 		}
 		rtr_host[i].proto = proto;
-		strncpy (rtr_host[i].host, host, sizeof (rtr_host[i].proto)-1);
+		strncpy (rtr_host[i].host, host, sizeof (rtr_host[i].host)-1);
 		rtr_host[i].port = r_num_get (core->num, port);
 		strncpy (rtr_host[i].file, file, sizeof (rtr_host[i].file)-1);
 		rtr_host[i].fd = fd;
@@ -1609,17 +1616,18 @@ R_API void r_core_rtr_session(RCore *core, const char *input) {
 	int fd;
 
 	prompt[0] = 0;
-	if (IS_DIGIT(input[0])) {
+	if (IS_DIGIT (input[0])) {
 		fd = r_num_math (core->num, input);
 		for (rtr_n = 0; rtr_host[rtr_n].fd \
 			&& rtr_host[rtr_n].fd->fd != fd \
 			&& rtr_n < RTR_MAX_HOSTS - 1; rtr_n++);
 	}
 
-	for (;;) {
-		if (rtr_host[rtr_n].fd)
+	while (!r_cons_is_breaked ()) {
+		if (rtr_host[rtr_n].fd) {
 			snprintf (prompt, sizeof (prompt),
-				"fd:%d> ", rtr_host[rtr_n].fd->fd);
+				"fd:%d> ", (int)(size_t)rtr_host[rtr_n].fd->fd);
+		}
 		free (r_line_singleton ()->prompt);
 		r_line_singleton ()->prompt = strdup (prompt);
 		if (r_cons_fgets (buf, sizeof (buf), 0, NULL) < 1) {
@@ -1653,9 +1661,22 @@ static void r_rap_packet_fill(ut8 *buf, const ut8* src, int len) {
 	}
 }
 
-static void r_core_rtr_rap_run(RCore *core, const char *input) {
-	/* ouch, this hurts a bit, isnt? */
-	r_core_cmdf (core, "o rap://%s", input);
+static bool r_core_rtr_rap_run(RCore *core, const char *input) {
+	char *file = r_str_newf ("rap://%s", input);
+	int flags = R_IO_READ | R_IO_WRITE;
+	RIODesc *fd = r_io_open_nomap (core->io, file, flags, 0644);
+	if (fd) {
+		if (r_io_is_listener (core->io)) {
+			if (!r_core_serve (core, fd)) {
+				r_cons_singleton () -> breaked = true;
+			}
+			r_io_desc_free (fd);
+		}
+	} else {
+		r_cons_singleton ()->breaked = true;
+	}
+	return !r_cons_singleton ()->breaked;
+	// r_core_cmdf (core, "o rap://%s", input);
 }
 
 static int r_core_rtr_rap_thread (RThread *th) {
@@ -1666,8 +1687,7 @@ static int r_core_rtr_rap_thread (RThread *th) {
 	if (!rt || !rt->core) {
 		return false;
 	}
-	r_core_rtr_rap_run (rt->core, rt->input);
-	return true;
+	return r_core_rtr_rap_run (rt->core, rt->input);
 }
 
 R_API void r_core_rtr_cmd(RCore *core, const char *input) {
@@ -1687,10 +1707,15 @@ R_API void r_core_rtr_cmd(RCore *core, const char *input) {
 			eprintf ("RAP Thread is already running\n");
 			eprintf ("This is experimental and probably buggy. Use at your own risk\n");
 		} else {
-			RapThread rt = { core, input + 1 };
-			rapthread = r_th_new (r_core_rtr_rap_thread, &rt, false);
-			r_th_start (rapthread, true);
-			eprintf ("Background rap server started.\n");
+			RapThread *RT = R_NEW0 (RapThread);
+			if (RT) {
+				RT->core = core;
+				RT->input = strdup (input + 1);
+				//RapThread rt = { core, strdup (input + 1) };
+				rapthread = r_th_new (r_core_rtr_rap_thread, RT, false);
+				r_th_start (rapthread, true);
+				eprintf ("Background rap server started.\n");
+			}
 		}
 		return;
 	}
@@ -1771,7 +1796,7 @@ R_API void r_core_rtr_cmd(RCore *core, const char *input) {
 		eprintf ("Error: Allocating cmd output\n");
 		return;
 	}
-	r_socket_read (fh, (ut8*)cmd_output, cmd_len);
+	r_socket_read_block (fh, (ut8*)cmd_output, cmd_len);
 	//ensure the termination
 	cmd_output[cmd_len] = 0;
 	r_cons_println (cmd_output);
@@ -1822,6 +1847,8 @@ R_API int r_core_rtr_cmds (RCore *core, const char *port) {
 	}
 
 	s = r_socket_new (0);
+	s->local = r_config_get_i(core->config, "tcp.islocal");
+
 	if (!r_socket_listen (s, port, NULL)) {
 		eprintf ("Error listening on port %s\n", port);
 		r_socket_free (s);
@@ -1845,9 +1872,9 @@ R_API int r_core_rtr_cmds (RCore *core, const char *port) {
 					buf[i] = buf[i + 1]? ';': '\0';
 				}
 			}
-			if (!r_config_get_i (core->config, "scr.prompt") &&
-			    (!strcmp ((char *)buf, "q!") ||
-			    !strcmp ((char *)buf, ".--"))) {
+			if ((!r_config_get_i (core->config, "scr.prompt") &&
+			     !strcmp ((char *)buf, "q!")) ||
+			    !strcmp ((char *)buf, ".--")) {
 				r_socket_close (ch);
 				break;
 			}

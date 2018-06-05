@@ -6,9 +6,7 @@
 
 #include <r_lib.h>
 #include <r_util.h>
-#include <r_flag.h>
 #include <r_anal.h>
-#include <r_reg.h>
 #include <r_parse.h>
 // 16 bit examples
 //    0x0001f3a4      9a67620eca       call word 0xca0e:0x6267
@@ -53,7 +51,7 @@ static int replace (int argc, char *argv[], char *newstr) {
 		{ "fsub",  "# = # - #", {1, 1, 2}},
 		{ "fxch",  "#,# = #,#", {1, 2, 2, 1}},
 		{ "idiv",  "# /= #", {1, 2}},
-		{ "imul",  "# *= #", {1, 2}},
+		{ "imul",  "# = # * #", {1, 2, 3}},
 		{ "in",   "# = io[#]", {1, 2}},
 		{ "inc",  "#++", {1}},
 		{ "ja", "if (((unsigned) var) > 0) goto #", {1}},
@@ -74,9 +72,14 @@ static int replace (int argc, char *argv[], char *newstr) {
 		{ "movntdq", "# = #", {1, 2}},
 		{ "movnti", "# = #", {1, 2}},
 		{ "movntpd", "# = #", {1, 2}},
-		{ "mul",  "# *= #", {1, 2}},
+		{ "movdqu", "# = #", {1, 2}},
+		{ "movdqa", "# = #", {1, 2}},
+		{ "pextrb", "# = (byte) # [#]", {1, 2, 3}},
+		{ "palignr", "# = # align #", {1, 2, 3}},
+		{ "pxor", "# ^= #", {1, 2}},
+		{ "mul",  "# = # * #", {1, 2, 3}},
 		{ "neg",  "# ~= #", {1, 1}},
-		{ "nop",  "no operation", {0}},
+		{ "nop",  "", {0}},
 		{ "not",  "# = !#", {1, 1}},
 		{ "or",   "# |= #", {1, 2}},
 		{ "out",  "io[#] = #", {1, 2}},
@@ -156,32 +159,29 @@ static int replace (int argc, char *argv[], char *newstr) {
 
 static int parse (RParse *p, const char *data, char *str) {
 	char w0[256], w1[256], w2[256], w3[256];
-	int i, len = strlen (data);
+	int i;
+	size_t len = strlen (data);
 	int sz = 32;
-	char *buf, *ptr, *optr;
+	char *buf, *ptr, *optr, *end;
 	if (len >= sizeof (w0) || sz >= sizeof (w0)) {
 		return false;
 	}
-	// malloc can be slow here :?
-	if (!(buf = malloc (len + 1))) {
+	// strdup can be slow here :?
+	if (!(buf = strdup (data))) {
 		return false;
 	}
-	memcpy (buf, data, len + 1);
 	if (*buf) {
 		*w0 = *w1 = *w2 = *w3 = '\0';
+		end = strchr (buf, '\0');
 		ptr = strchr (buf, ' ');
 		if (!ptr) {
 			ptr = strchr (buf, '\t');
 		}
 		if (!ptr) {
-			ptr = strchr (buf, '\0');
-		}
-		if (!ptr) {
-			free (buf);
-			return false;
+			ptr = end;
 		}
 		*ptr = '\0';
-		for (++ptr; *ptr == ' '; ptr++);
+		if (ptr != end) for (++ptr; *ptr == ' '; ptr++);
 		r_str_ncpy (w0, buf, sizeof (w0));
 		r_str_ncpy (w1, ptr, sizeof (w1));
 		optr = ptr;
@@ -199,7 +199,7 @@ static int parse (RParse *p, const char *data, char *str) {
 				r_str_ncpy (w2, optr, sizeof (w2));
 				r_str_ncpy (w3, ptr, sizeof (w3));
 			}
-		}	
+		}
 	}
 	char *wa[] = { w0, w1, w2, w3 };
 	int nw = 0;
@@ -208,30 +208,46 @@ static int parse (RParse *p, const char *data, char *str) {
 			nw++;
 		}
 	}
-	if (strstr (w0, "mul") && nw == 2 ) {
-		r_str_ncpy (wa[2], wa[1], sizeof (w2));
+	/* TODO: interpretation of memory location fails*/
+	//ensure imul & mul interpretations works
+	if (strstr (w0, "mul")) {
+		if (nw == 2)
+		{
+			r_str_ncpy (wa[3], wa[1], sizeof (w3));
 
-		switch (wa[2][0]) {
-		case 'q':
-		case 'r': //qword, r..
-			r_str_ncpy (wa[1], "rax", sizeof (w1));
-			break;
-		case 'd':
-		case 'e': //dword, e..
-			if (strlen (wa[2]) > 2) {
-				r_str_ncpy (wa[1], "eax", sizeof (w1));
+			switch (wa[3][0]) {
+			case 'q':
+			case 'r': //qword, r..
+				r_str_ncpy (wa[1], "rax", sizeof (w1));
+				r_str_ncpy (wa[2], "rax", sizeof (w2));
 				break;
-			}
-		default : // .x, .p, .i or word
-			if (wa[2][1] == 'x' || wa[2][1] == 'p' || \
-				wa[2][1] == 'i' || wa[2][0] == 'w') {
-				r_str_ncpy (wa[1], "ax", sizeof (w1));
-			} else { // byte and lowest 8 bit registers
-				r_str_ncpy (wa[1], "al", sizeof (w1));
+			case 'd':
+			case 'e': //dword, e..
+				if (strlen (wa[3]) > 2) {
+					r_str_ncpy (wa[1], "eax", sizeof (w1));
+					r_str_ncpy (wa[2], "eax", sizeof (w2));
+					break;
+				}
+			default : // .x, .p, .i or word
+				if (wa[3][1] == 'x' || wa[3][1] == 'p' || \
+					wa[3][1] == 'i' || wa[3][0] == 'w') {
+					r_str_ncpy (wa[1], "ax", sizeof (w1));
+					r_str_ncpy (wa[2], "ax", sizeof (w2));
+				} else { // byte and lowest 8 bit registers
+					r_str_ncpy (wa[1], "al", sizeof (w1));
+					r_str_ncpy (wa[2], "al", sizeof (w2));
+				}
 			}
 		}
+		else if (nw == 3)
+		{
+			r_str_ncpy (wa[3], wa[2], sizeof (w3));
+			r_str_ncpy (wa[2], wa[1], sizeof (w2));
+		}
+		
 		replace (nw, wa, str);
-	} else if (strstr (w1, "ax") || strstr (w1, "ah") || strstr (w1, "al") && !p->retleave_asm) {
+
+	} else if ((strstr (w1, "ax") || strstr (w1, "ah") || strstr (w1, "al")) && !p->retleave_asm) {
 		if (!(p->retleave_asm = (char *) malloc (sz))) {
 			return false;
 		}
@@ -366,10 +382,6 @@ static bool varsub (RParse *p, RAnalFunction *f, ut64 addr, int oplen, char *dat
 				tstr_new = r_str_newf ("%s0x%08"PFMT64x"%s", tstr, repl_num, ripend);
 				free (tstr);
 				tstr = tstr_new;
-				if (!strncasecmp (tstr, "lea", 3)) {
-					r_str_replace_char (tstr, '[', 0);
-					r_str_replace_char (tstr, ']', 0);
-				}
 			}
 		}
 	}

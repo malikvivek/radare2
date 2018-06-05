@@ -282,8 +282,10 @@ typedef struct r_debug_t {
 	RDebugTrace *trace;
 	Sdb *tracenodes;
 	RTree *tree;
+	RList *call_frames;
 
 	RReg *reg;
+	RList *q_regs;
 	const char *creg; // current register value
 	RBreakpoint *bp;
 	void *user; // XXX(jjd): unused?? meant for caller's use??
@@ -506,7 +508,6 @@ R_API int r_debug_reg_set(RDebug *dbg, const char *name, ut64 num);
 R_API ut64 r_debug_reg_get(RDebug *dbg, const char *name);
 R_API ut64 r_debug_reg_get_err(RDebug *dbg, const char *name, int *err, utX *value);
 
-R_API void r_debug_io_bind(RDebug *dbg, RIO *io);
 R_API ut64 r_debug_execute(RDebug *dbg, const ut8 *buf, int len, int restore);
 R_API int r_debug_map_sync(RDebug *dbg);
 

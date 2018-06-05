@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2008-2016 - pancake */
+/* radare - LGPL - Copyright 2008-2018 - pancake */
 
 #include <r_cons.h>
 #define I r_cons_singleton ()
@@ -57,12 +57,13 @@ static void filesave() {
 	}
 	if (lines) {
 		for (i = 0; i < bytes; i++) {
-			if (lines[i] == '\0')
+			if (lines[i] == '\0') {
 				lines[i] = '\n';
+			}
 		}
 	}
 	if (r_file_dump (path, (const ut8 *)lines, bytes, 0)) {
-		eprintf ("File '%s' saved (%d bytes)\n", path, bytes);
+		eprintf ("File '%s' saved (%d byte(s))\n", path, bytes);
 	} else {
 		eprintf ("Cannot save file\n");
 	}
@@ -72,8 +73,8 @@ static void filesave() {
 R_API char *r_cons_editor(const char *file, const char *str) {
 	const char *line;
 	_n = 0;
-	if (I->editor) {
-		return I->editor (I->user, file, str);
+	if (I->cb_editor) {
+		return I->cb_editor (I->user, file, str);
 	}
 	free (path);
 	if (file) {
@@ -81,7 +82,7 @@ R_API char *r_cons_editor(const char *file, const char *str) {
 		bytes = 0;
 		lines = r_file_slurp (file, &bytes);
 		nlines = r_str_split (lines, '\n');
-		eprintf ("Loaded %d lines on %d bytes\n",
+		eprintf ("Loaded %d lines on %d byte(s)\n",
 			(nlines? (nlines - 1): 0), bytes);
 	} else {
 		path = NULL;

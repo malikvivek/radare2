@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2009-2017 - pancake */
+/* radare - LGPL - Copyright 2009-2018 - pancake */
 
 #include <string.h>
 #include "r_bin.h"
@@ -25,7 +25,9 @@ static const char *help_msg_i[] = {
 	"idp", "", "Load pdb file information",
 	"iD", " lang sym", "demangle symbolname for given language",
 	"ie", "", "Entrypoint",
+	"iee", "", "Show Entry and Exit (preinit, init and fini)",
 	"iE", "", "Exports (global symbols)",
+	"iE.", "", "Current export",
 	"ih", "", "Headers (alias for iH)",
 	"iHH", "", "Verbose Headers in raw text",
 	"ii", "", "Imports",
@@ -36,13 +38,18 @@ static const char *help_msg_i[] = {
 	"im", "", "Show info about predefined memory allocation",
 	"iM", "", "Show main address",
 	"io", " [file]", "Load info from file (or last opened) use bin.baddr",
+	"iO", "[?]", "Perform binary operation (dump, resize, change sections, ...)",
 	"ir", "", "Relocs",
 	"iR", "", "Resources",
 	"is", "", "Symbols",
+	"is.", "", "Current symbol",
 	"iS ", "[entropy,sha1]", "Sections (choose which hash algorithm to use)",
+	"iS.", "", "Current section",
 	"iV", "", "Display file version info",
 	"iz|izj", "", "Strings in data sections (in JSON/Base64)",
 	"izz", "", "Search for Strings in the whole binary",
+	"izzz", "", "Dump Strings from whole binary to r2 shell (for huge files)",
+	"iz-", " [addr]", "Purge string via bin.strpurge",
 	"iZ", "", "Guess size of binary program",
 	NULL
 };
@@ -89,6 +96,7 @@ static bool demangle_internal(RCore *core, const char *lang, const char *s) {
 	case R_BIN_NM_OBJC: res = r_bin_demangle_objc (NULL, s); break;
 	case R_BIN_NM_SWIFT: res = r_bin_demangle_swift (s, core->bin->demanglercmd); break;
 	case R_BIN_NM_DLANG: res = r_bin_demangle_plugin (core->bin, "dlang", s); break;
+	case R_BIN_NM_MSVC: res = r_bin_demangle_msvc (s); break;
 	default:
 		r_bin_demangle_list (core->bin);
 		return true;
@@ -129,8 +137,8 @@ static void r_core_file_info(RCore *core, int mode) {
 	bool io_cache = r_config_get_i (core->config, "io.cache");
 	RBinInfo *info = r_bin_get_info (core->bin);
 	RBinFile *binfile = r_core_bin_cur (core);
-	RCoreFile *cf = core->file;
-	RIODesc *desc = cf ? r_io_desc_get (core->io, cf->fd) : NULL;
+	int fd = r_io_fd_get_current (core->io);
+	RIODesc *desc = r_io_desc_get (core->io, fd);
 	RBinPlugin *plugin = r_bin_file_cur_plugin (binfile);
 	if (mode == R_CORE_BIN_JSON) {
 		r_cons_printf ("{");
@@ -144,12 +152,12 @@ static void r_core_file_info(RCore *core, int mode) {
 	if (info) {
 		fn = info->file;
 		if (mode == R_CORE_BIN_JSON) {
-			r_cons_printf ("\"type\":\"%s\"", STR (info->type));
+			r_cons_printf ("\"type\":\"%s\",", STR (info->type));
 		}
 	} else {
 		fn = desc ? desc->name: NULL;
 	}
-	if (cf && mode == R_CORE_BIN_JSON) {
+	if (desc && mode == R_CORE_BIN_JSON) {
 		const char *uri = fn;
 		if (!uri) {
 			if (desc && desc->uri && *desc->uri) {
@@ -160,7 +168,7 @@ static void r_core_file_info(RCore *core, int mode) {
 		}
 		{
 			char *escapedFile = r_str_utf16_encode (uri, -1);
-			r_cons_printf (",\"file\":\"%s\"", escapedFile);
+			r_cons_printf ("\"file\":\"%s\"", escapedFile);
 			free (escapedFile);
 		}
 		if (dbg) {
@@ -198,17 +206,17 @@ static void r_core_file_info(RCore *core, int mode) {
 			}
 		}
 		r_cons_printf ("}");
-	} else if (cf && mode != R_CORE_BIN_SIMPLE) {
+	} else if (desc && mode != R_CORE_BIN_SIMPLE) {
 		//r_cons_printf ("# Core file info\n");
 		if (dbg) {
 			dbg = R_IO_WRITE | R_IO_EXEC;
 		}
 		if (desc) {
-			pair ("blksz", sdb_fmt (0, "0x%"PFMT64x, (ut64) core->io->desc->obsz));
+			pair ("blksz", sdb_fmt ("0x%"PFMT64x, (ut64) core->io->desc->obsz));
 		}
-		pair ("block", sdb_fmt (0, "0x%x", core->blocksize));
+		pair ("block", sdb_fmt ("0x%x", core->blocksize));
 		if (desc) {
-			pair ("fd", sdb_fmt (0, "%d", desc->fd));
+			pair ("fd", sdb_fmt ("%d", desc->fd));
 		}
 		if (fn || (desc && desc->uri)) {
 			pair ("file", fn? fn: desc->uri);
@@ -229,7 +237,7 @@ static void r_core_file_info(RCore *core, int mode) {
 		if (desc) {
 			ut64 fsz = r_io_desc_size (desc);
 			if (fsz != UT64_MAX) {
-				pair ("size", sdb_fmt (0,"0x%"PFMT64x, fsz));
+				pair ("size", sdb_itoca (fsz));
 				char *humansz = r_num_units (NULL, fsz);
 				if (humansz) {
 					pair ("humansz", humansz);
@@ -304,10 +312,11 @@ static void playMsg(RCore *core, const char *n, int len) {
 static int cmd_info(void *data, const char *input) {
 	RCore *core = (RCore *) data;
 	bool newline = r_config_get_i (core->config, "scr.interactive");
-	RCoreFile *cf = core->file;
-	RIODesc *desc = cf ? r_io_desc_get (core->io, cf->fd) : NULL;
+	int fd = r_io_fd_get_current (core->io);
+	RIODesc *desc = r_io_desc_get (core->io, fd);
 	int i, va = core->io->va || core->io->debug;
 	int mode = 0; //R_CORE_BIN_SIMPLE;
+	bool rdump = false;
 	int is_array = 0;
 	Sdb *db;
 
@@ -320,7 +329,6 @@ static int cmd_info(void *data, const char *input) {
 		case 'q': mode = R_CORE_BIN_SIMPLE; break;
 		}
 	}
-
 	if (mode == R_CORE_BIN_JSON) {
 		if (strlen (input + 1) > 1) {
 			is_array = 1;
@@ -400,7 +408,7 @@ static int cmd_info(void *data, const char *input) {
 		break;
 		case 'o':
 		{
-			if (!cf) {
+			if (!desc) {
 				eprintf ("Core file not open\n");
 				return 0;
 			}
@@ -427,13 +435,39 @@ static int cmd_info(void *data, const char *input) {
 				r_bin_list_archs (core->bin, 1);
 			}
 			break;
-		case 'E': RBININFO ("exports", R_CORE_BIN_ACC_EXPORTS, NULL, 0); break;
+		case 'E': 
+		{
+			// case for iEj.
+			if (input[1] == 'j' && input[2] == '.') {	
+				mode = R_CORE_BIN_JSON;
+				RBININFO ("exports", R_CORE_BIN_ACC_EXPORTS, input + 2, 0); 
+			} else {
+				RBININFO ("exports", R_CORE_BIN_ACC_EXPORTS, input + 1, 0); 
+			}
+			while (*(++input)) ;
+			input--;
+			break;
+		}
 		case 'Z': RBININFO ("size", R_CORE_BIN_ACC_SIZE, NULL, 0); break;
+		case 'O':
+			switch (input[1]) {
+			case ' ':
+			        r_sys_cmdf ("rabin2 -O \"%s\" \"%s\"", r_str_trim_ro (input + 1), desc->name);
+			        break;
+			default:
+			        r_sys_cmdf ("rabin2 -O help");
+			        break;
+			}
+			return 0;
 		case 'S':
 			//we comes from ia or iS
 			if ((input[1] == 'm' && input[2] == 'z') || !input[1]) {
 				RBININFO ("sections", R_CORE_BIN_ACC_SECTIONS, NULL, 0);
 			} else {  //iS entropy,sha1
+				// case for iSj.
+				if (input[1] == 'j' && input[2] == '.') {
+					mode = R_CORE_BIN_JSON;
+				}
 				RBinObject *obj = r_bin_cur_object (core->bin);
 				if (mode == R_CORE_BIN_RADARE || mode == R_CORE_BIN_JSON || mode == R_CORE_BIN_SIMPLE) {
 					RBININFO ("sections", R_CORE_BIN_ACC_SECTIONS, input + 2,
@@ -475,28 +509,22 @@ static int cmd_info(void *data, const char *input) {
 			} else {
 				r_bin_list (core->bin, json);
 			}
-
 			newline = false;
-
 			goto done;
 		}
 		break;
 		case 's':
-			if (input[1] == '.') {
-				ut64 addr = core->offset + (core->print->cur_enabled? core->print->cur: 0);
-				RFlagItem *f = r_flag_get_at (core->flags, addr, false);
-				if (f) {
-					if (f->offset == addr || !f->offset) {
-						r_cons_printf ("%s", f->name);
-					} else {
-						r_cons_printf ("%s+%d", f->name, (int) (addr - f->offset));
-					}
-				}
-				input++;
-				break;
-			} else {
+			{
 				RBinObject *obj = r_bin_cur_object (core->bin);
-				RBININFO ("symbols", R_CORE_BIN_ACC_SYMBOLS, NULL, obj? r_list_length (obj->symbols): 0);
+  			// Case for isj.
+				if (input[1] == 'j' && input[2] == '.') {
+					mode = R_CORE_BIN_JSON;
+					RBININFO ("symbols", R_CORE_BIN_ACC_SYMBOLS, input + 2, obj? r_list_length (obj->symbols): 0);
+				} else {
+					RBININFO ("symbols", R_CORE_BIN_ACC_SYMBOLS, input + 1, obj? r_list_length (obj->symbols): 0);
+				}
+				while (*(++input)) ;
+				input--;
 				break;
 			}
 		case 'R':
@@ -527,6 +555,7 @@ static int cmd_info(void *data, const char *input) {
 					pdbopts.user_agent = (char*) r_config_get (core->config, "pdb.useragent");
 					pdbopts.symbol_server = (char*) r_config_get (core->config, "pdb.server");
 					pdbopts.extract = r_config_get_i (core->config, "pdb.extract");
+					pdbopts.symbol_store_path = (char*) r_config_get (core->config, "pdb.symstore");
 					int r = r_bin_pdb_download (core, 0, NULL, &pdbopts);
 					if (r > 0) {
 						eprintf ("Error while downloading pdb file");
@@ -565,10 +594,24 @@ static int cmd_info(void *data, const char *input) {
 								filename = strdup (basename);
 							}
 						}
+
+						// Last chance: Check if file is in downstream symbol store
+						if (!file_found) {
+							const char* symstore_path = r_config_get (core->config, "pdb.symstore");
+							char* pdb_path = r_str_newf ("%s" R_SYS_DIR "%s" R_SYS_DIR "%s" R_SYS_DIR "%s",
+										     symstore_path, info->debug_file_name,
+										     info->guid, info->debug_file_name);
+							file_found = r_file_exists (pdb_path);
+							if (file_found) {
+								filename = pdb_path;
+							} else {
+								R_FREE(pdb_path);
+							}
+						}
 					}
 
 					if (!file_found) {
-						eprintf ("File '%s' not found", filename);
+						eprintf ("File '%s' not found in file directory or symbol store", info->debug_file_name);
 						free (filename);
 						break;
 					}
@@ -578,15 +621,7 @@ static int cmd_info(void *data, const char *input) {
 					} else {
 						eprintf ("Warning: Cannot find base address, flags will probably be misplaced\n");
 					}
-					RCoreFile *file = r_core_file_open (core, filename, R_IO_READ, baddr);
-					r_core_bin_load (core, filename, baddr);
-					if (!file) {
-						eprintf ("Error while opening '%s'", filename);
-						break;
-					}
-					RCoreBinFilter filter = { 0 };
-					r_core_bin_info (core, R_CORE_BIN_ACC_PDB, mode, true, &filter, NULL);
-					r_core_file_close (core, file);
+					r_core_pdb_info (core, filename, baddr, mode);
 					free (filename);
 					break;
 				case '?':
@@ -623,8 +658,31 @@ static int cmd_info(void *data, const char *input) {
 		case 'V': RBININFO ("versioninfo", R_CORE_BIN_ACC_VERSIONINFO, NULL, 0); break;
 		case 'C': RBININFO ("signature", R_CORE_BIN_ACC_SIGNATURE, NULL, 0); break;
 		case 'z':
-			if (input[1] == 'z') { //izz
+			if (input[1] == '-') { //iz-
+				char *strpurge = core->bin->strpurge;
+				ut64 addr = core->offset;
+				bool old_tmpseek = core->tmpseek;
+				input++;
+				if (input[1] == ' ') {
+					const char *argstr = r_str_trim_ro (input + 2);
+					ut64 arg = r_num_get (NULL, argstr);
+					input++;
+					if (arg != 0 || *argstr == '0') {
+						addr = arg;
+					}
+				}
+				core->tmpseek = false;
+				r_core_cmdf (core, "e bin.strpurge=%s%s0x%" PFMT64x,
+				             strpurge ? strpurge : "",
+				             strpurge && *strpurge ? "," : "",
+				             addr);
+				core->tmpseek = old_tmpseek;
+				newline = false;
+			} else if (input[1] == 'z') { //izz
 				switch (input[2]) {
+				case 'z'://izzz
+					rdump = true;
+					break;
 				case '*':
 					mode = R_CORE_BIN_RADARE;
 					break;
@@ -644,6 +702,18 @@ static int cmd_info(void *data, const char *input) {
 					break;
 				}
 				input++;
+				if (rdump) {
+					RBinFile *bf = r_core_bin_cur (core);
+					int min = r_config_get_i (core->config, "bin.minstr");
+					if (bf) {
+						int tmp = bf->rawstr;
+						bf->rawstr = 2;
+						bf->strmode = mode;
+						r_bin_dump_strings (bf, min);
+						bf->rawstr = tmp;
+					}
+					goto done;
+				}
 				RBININFO ("strings", R_CORE_BIN_ACC_RAW_STRINGS, NULL, 0);
 			} else {
 				RBinObject *obj = r_bin_cur_object (core->bin);
@@ -776,7 +846,7 @@ static int cmd_info(void *data, const char *input) {
 			break;
 		case '?':
 			r_core_cmd_help (core, help_msg_i);
-			goto done;
+			goto redone;
 		case '*':
 			mode = R_CORE_BIN_RADARE;
 			goto done;
@@ -812,5 +882,6 @@ done:
 	if (newline) {
 		r_cons_newline ();
 	}
+redone:
 	return 0;
 }

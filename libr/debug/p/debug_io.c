@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2016-2017 pancake */
+/* radare - LGPL - Copyright 2016-2018 pancake */
 
 #include <r_io.h>
 #include <r_asm.h>
@@ -108,7 +108,7 @@ static int __reg_read(RDebug *dbg, int type, ut8 *buf, int size) {
 		free (dr8);
 		return -1;
 	}
-	r_str_chop ((char *)bregs);
+	r_str_trim ((char *)bregs);
 	int sz = r_hex_str2bin (dr8, bregs);
 	if (sz > 0) {
 		memcpy (buf, bregs, R_MIN (size, sz));
@@ -132,7 +132,7 @@ static int __io_continue(RDebug *dbg, int pid, int tid, int sig) {
 
 // "dk" send kill signal
 static bool __io_kill(RDebug *dbg, int pid, int tid, int sig) {
-	const char *cmd = sdb_fmt (-1, "dk %d", sig);
+	const char *cmd = sdb_fmt ("dk %d", sig);
 	dbg->iob.system (dbg->iob.io, cmd);
 	r_cons_flush ();
 	return true;

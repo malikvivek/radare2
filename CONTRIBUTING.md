@@ -20,10 +20,16 @@ try to keep the codebase consistent and clean.
 * Make sure you have a GitHub account.
 * Fork the repository on GitHub.
 * Create a topic branch from master. Please avoid working directly on the ```master``` branch.
-* Makes commits of logical units.
+* Make commits of logical units.
 * Check for unnecessary whitespace with ```git diff --check``` and be sure to follow the CODINGSTYLE (more on this in the next section).
 * Submit the Pull Request(PR) on Github.
-* When relevant, write a test for [radare2-regressions](https://github.com/radare/radare2-regressions) and submit a PR also there.
+* When relevant, write a test for
+  [radare2-regressions](https://github.com/radare/radare2-regressions) and
+  submit a PR also there. Use the same branch name in both repositories, so
+  Travis will be able to use your new tests together with new changes. 
+  AppVeyor (for now) still uses radare/radare2-regressions repo with branch
+  master. NOTE: when merging PRs, *always* merge the radare2-regressions PR
+  first.
 
 ## Coding Style guidelines
 
@@ -38,12 +44,11 @@ default:
 }
 ```
 
-* Lines should be at most 78 chars. A tab is considered as 8 chars.
+* Lines should be at most 78 chars. A tab is considered as 4 chars.
 
 * Braces open on the same line as the for/while/if/else/function/etc. Closing
   braces are put on a line of their own, except in the else of an if statement
-  or in a while of a do-while statement. Always use braces for if and while,
-  except when the expressions are very simple and they can fit in a one-line.
+  or in a while of a do-while statement. Always use braces for if and while.
 
 ```c
 if (a == b) {
@@ -55,15 +60,6 @@ if (a == b) {
 } else if (a > b) {
 	...
 }
-
-if (a == b) do_something ();
-
-if (a == b) do_something ();
-else do_something_else ();
-
-if (!ok) return false;
-
-if (!buf) goto err_buf;
 
 if (a == b) {
 	...
@@ -159,6 +155,8 @@ r_core_wrap.cxx:32103:61: error: assigning to 'RDebugReasonType' from incompatib
 ````
 
 * Do not leave trailing whitespaces at the end of line
+
+* Do not use asserts
 
 * Do not use C99 variable declaration
   - This way we reduce the number of local variables per function

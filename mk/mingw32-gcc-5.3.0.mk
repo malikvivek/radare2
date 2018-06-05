@@ -5,7 +5,9 @@ RANLIB=mingw32-gcc-ranlib
 OSTYPE=windows
 ONELIB=0
 LINK=-shared
-CC_AR=mingw32-gcc-ar ${LIBAR}
+AR=mingw32-gcc-ar
+CC_AR=${AR} ${LIBAR}
+PARTIALLD=mingw32-gcc-ld -r --whole-archive
 PICFLAGS=
 #CFLAGS+=${PICFLAGS} -MD -D__WINDOWS__=1
 CFLAGS+=${PICFLAGS} -D__WINDOWS__=1

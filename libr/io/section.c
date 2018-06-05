@@ -1,4 +1,4 @@
-/* radare2 - LGPL - Copyright 2017 - condret , alvarofe*/
+/* radare2 - LGPL - Copyright 2017-2018 - condret , alvarofe */
 
 #include <r_io.h>
 #include <r_util.h>
@@ -18,11 +18,11 @@ static void section_free(void *p) {
 R_API void r_io_section_init(RIO *io) {
 	if (io) {
 		if (!io->sections) {
-			if (!(io->sections = ls_newf (section_free))) {
-				return;
-			}
+			io->sections = ls_newf (section_free);
 		}
-		io->sec_ids = r_id_pool_new (0, UT32_MAX);
+		if (!io->sec_ids) {
+			io->sec_ids = r_id_pool_new (0, UT32_MAX);
+		}
 	}
 }
 
@@ -125,6 +125,7 @@ R_API SdbList *r_io_section_bin_get(RIO *io, ut32 bin_id) {
 	if (!io || !io->sections) {
 		return NULL;
 	}
+	// O(n) -> we can use the r_id api to resolve s from bin_id
 	ls_foreach (io->sections, iter, s) {
 		if (s->bin_id == bin_id) {
 			if (!ret) {
@@ -137,20 +138,20 @@ R_API SdbList *r_io_section_bin_get(RIO *io, ut32 bin_id) {
 }
 
 R_API bool r_io_section_bin_rm(RIO *io, ut32 bin_id) {
-	RIOSection *s;
-	SdbListIter *iter, *niter;
-	int length;
 	if (!io || !io->sections || !io->sections->head || !io->sec_ids) {
 		return false;
 	}
-	length = ls_length (io->sections);
+	bool has_changed = false;
+	RIOSection *s;
+	SdbListIter *iter, *niter;
 	ls_foreach_safe (io->sections, iter, niter, s) {
 		if (s->bin_id == bin_id) {
 			r_id_pool_kick_id (io->sec_ids, s->id);
 			ls_delete (io->sections, iter);
+			has_changed = true;
 		}
 	}
-	return (!(length == ls_length (io->sections)));
+	return has_changed;
 }
 
 R_API RIOSection *r_io_section_get_name(RIO *io, const char *name) {
@@ -168,8 +169,6 @@ R_API RIOSection *r_io_section_get_name(RIO *io, const char *name) {
 }
 
 R_API void r_io_section_cleanup(RIO *io) {
-	SdbListIter *iter, *ator;
-	RIOSection *s;
 	if (!io || !io->sections || !io->sec_ids) {
 		return;
 	}
@@ -178,6 +177,8 @@ R_API void r_io_section_cleanup(RIO *io) {
 		r_io_section_init (io);
 		return;
 	}
+	RIOSection *s;
+	SdbListIter *iter, *ator;
 	ls_foreach_safe (io->sections, iter, ator, s) {
 		if (!s) {
 			ls_delete (io->sections, iter);
@@ -220,6 +221,7 @@ R_API SdbList *r_io_sections_vget(RIO *io, ut64 vaddr) {
 	if (!io || !io->sections) {
 		return NULL;
 	}
+	// O(n)
 	ls_foreach (io->sections, iter, s) {
 		if (vaddr >= s->vaddr && vaddr < (s->vaddr + s->vsize)) {
 			if (!ret) {
@@ -232,18 +234,18 @@ R_API SdbList *r_io_sections_vget(RIO *io, ut64 vaddr) {
 }
 
 R_API RIOSection* r_io_section_vget(RIO *io, ut64 vaddr) {
-	if (io) {
-		SdbList *sects = r_io_sections_vget (io, vaddr);
-		RIOSection *ret = NULL;
-		if (sects) {
-			if (ls_length (sects)) {
-				ret = ls_pop (sects);
-			}
-		}
-		ls_free (sects);
-		return ret;
+	if (!io) {
+		return NULL;
 	}
-	return NULL;
+	SdbList *sects = r_io_sections_vget (io, vaddr);
+	RIOSection *ret = NULL;
+	if (sects) {
+		if (!ls_empty (sects)) {
+			ret = ls_pop (sects);
+		}
+	}
+	ls_free (sects);
+	return ret;
 }
 
 R_API RIOSection* r_io_section_get(RIO *io, ut64 vaddr) {
@@ -251,7 +253,7 @@ R_API RIOSection* r_io_section_get(RIO *io, ut64 vaddr) {
 		SdbList *sects = r_io_sections_get (io, vaddr);
 		RIOSection *ret = NULL;
 		if (sects) {
-			if (ls_length (sects)) {
+			if (!ls_empty (sects)) {
 				ret = ls_pop (sects);
 			}
 		}
@@ -266,7 +268,7 @@ R_API ut64 r_io_section_get_vaddr_at(RIO *io, ut64 paddr) {
 		SdbList *sects = r_io_sections_vget (io, paddr);
 		ut64 ret = UT64_MAX;
 		if (sects) {
-			if (ls_length (sects)) {
+			if (!ls_empty (sects)) {
 				RIOSection *s = ls_pop (sects);
 				ret = s->vaddr;
 			}
@@ -282,7 +284,7 @@ R_API ut64 r_io_section_get_paddr_at(RIO *io, ut64 paddr) {
 		SdbList *sects = r_io_sections_get (io, paddr);
 		ut64 ret = UT64_MAX;
 		if (sects) {
-			if (ls_length (sects)) {
+			if (!ls_empty (sects)) {
 				RIOSection *s = ls_pop (sects);
 				ret = s->paddr;
 			}
@@ -308,21 +310,17 @@ R_API int r_io_section_set_archbits(RIO *io, ut32 id, const char *arch, int bits
 }
 
 R_API const char *r_io_section_get_archbits(RIO *io, ut64 vaddr, int *bits) {
-	//cache section so we avoid making so many looks up
-	static RIOSection *s = NULL;
-	if (!s || (vaddr < s->vaddr) || (s->vaddr + s->vsize < vaddr)) {
-		s = r_io_section_vget (io, vaddr);
+	if (!io) {
+		return NULL;
 	}
+	RIOSection *s = r_io_section_vget (io, vaddr);
 	if (!s || !s->arch || !s->bits) {
 		return NULL;
 	}
-	if (s) {
-		if (bits) {
-			*bits = s->bits;
-		}
-		return r_sys_arch_str (s->arch);
+	if (bits) {
+		*bits = s->bits;
 	}
-	return NULL;
+	return r_sys_arch_str (s->arch);
 }
 
 R_API int r_io_section_bin_set_archbits(RIO *io, ut32 bin_id, const char *arch, int bits) {
@@ -372,7 +370,7 @@ R_API bool r_io_section_priorize(RIO *io, ut32 id) {
 			return ret; 
 		}
 	}
-	if (!(sec->filemap == sec->memmap)) {
+	if (sec->filemap != sec->memmap) {
 		return ret & r_io_map_priorize (io, sec->memmap);
 	}
 	return false;
@@ -393,8 +391,6 @@ R_API bool r_io_section_priorize_bin(RIO *io, ut32 bin_id) {
 	ls_free (secs);
 	return true;
 }
-
-
 
 static bool _section_apply_for_anal_patch(RIO *io, RIOSection *sec, bool patch) {
 	ut64 at;
@@ -419,10 +415,8 @@ static bool _section_apply_for_anal_patch(RIO *io, RIOSection *sec, bool patch) 
 		}
 	} else {
 		// same as above
-		if (!sec->filemap) {
-			if (r_io_create_file_map (io, sec, sec->vsize, patch, false)) {
-				return true;
-			}
+		if (!sec->filemap && r_io_create_file_map (io, sec, sec->vsize, patch, false)) {
+			return true;
 		}
 		return false;
 	}
@@ -493,11 +487,8 @@ static bool _section_apply(RIO *io, RIOSection *sec, RIOSectionApplyMethod metho
 }
 
 R_API bool r_io_section_apply(RIO *io, ut32 id, RIOSectionApplyMethod method) {
-	RIOSection *sec;
-	if (!(sec = r_io_section_get_i (io, id))) {
-		return false;
-	}
-	return _section_apply (io, sec, method);
+	RIOSection *sec = r_io_section_get_i (io, id);
+	return sec ? _section_apply (io, sec, method): false;
 }
 
 static bool _section_reapply_anal_or_patch(RIO *io, RIOSection *sec, RIOSectionApplyMethod method) {
@@ -511,7 +502,8 @@ static bool _section_reapply_anal_or_patch(RIO *io, RIOSection *sec, RIOSectionA
 		ls_foreach (io->maps, iter, map) {
 			if (map->id == sec->memmap) {
 				desc = r_io_desc_get (io, map->fd);
-				if (desc && desc->plugin && desc->plugin->close) {	//we can't use r_io_desc_close here, bc it breaks the section-list
+				// we can't use r_io_desc_close here, bc it breaks the section-list
+				if (desc && desc->plugin && desc->plugin->close) {
 					desc->plugin->close (desc);
 					r_io_desc_del (io, map->fd);
 				}

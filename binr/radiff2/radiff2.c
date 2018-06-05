@@ -1,8 +1,9 @@
-/* radare - LGPL - Copyright 2009-2017 - pancake */
+/* radare - LGPL - Copyright 2009-2018 - pancake */
 
 #include <r_diff.h>
 #include <r_core.h>
 #include <r_hash.h>
+#include <limits.h>
 #include <getopt.c>
 #ifdef _MSC_VER
 #ifndef WIN32_LEAN_AND_MEAN
@@ -112,16 +113,14 @@ static int cb(RDiff *d, void *user, RDiffOp *op) {
 				if (!quiet) {
 					printf (Color_RED);
 				}
-				if (r_mem_is_printable ((const ut8 *) s, R_MIN (strlen (s), 5))) {
-					printf ("- %s\n", s);
-				} else {
-					printf ("-:");
-					int len = op->a_len; // R_MIN (op->a_len, strlen (op->a_buf));
-					for (i = 0; i < len; i++) {
-						printf ("%02x", op->a_buf[i]);
-					}
-					printf (" \"%s\"\n", op->a_buf);
+				printf ("-0x%08"PFMT64x":", op->a_off);
+				int len = op->a_len; // R_MIN (op->a_len, strlen (op->a_buf));
+				for (i = 0; i < len; i++) {
+					printf ("%02x", op->a_buf[i]);
 				}
+				char *p = r_str_escape ((const char*)op->a_buf);
+				printf (" \"%s\"\n", p);
+				free (p);
 				if (!quiet) {
 					printf (Color_RESET);
 				}
@@ -133,17 +132,17 @@ static int cb(RDiff *d, void *user, RDiffOp *op) {
 				if (!quiet) {
 					printf (Color_GREEN);
 				}
-				if (r_mem_is_printable ((const ut8 *) s, R_MIN (strlen (s), 5))) {
-					printf ("+ %s\n", s);
-				} else {
-					printf ("+:");
-					for (i = 0; i < op->b_len; i++) {
-						printf ("%02x", op->b_buf[i]);
-					}
-					printf (" \"%s\"\n", op->b_buf);
+				printf ("+0x%08"PFMT64x":", op->b_off);
+				for (i = 0; i < op->b_len; i++) {
+					printf ("%02x", op->b_buf[i]);
 				}
 				if (!quiet) {
+					char *p = r_str_escape((const char*)op->b_buf);
+					printf (" \"%s\"\n", p);
+					free (p);
 					printf (Color_RESET);
+				} else {
+					printf ("\n");
 				}
 			}
 		}
@@ -243,7 +242,7 @@ static int cb(RDiff *d, void *user, RDiffOp *op) {
 			}
 			printf ("\n");
 			if (core) {
-				int len = R_MAX(4, op->b_len);
+				int len = R_MAX (4, op->b_len);
 				RAsmCode *ac = r_asm_mdisassemble (core->assembler, op->b_buf, len);
 				if (quiet) {
 					char *bufasm = r_str_prefix_all (strdup (ac->buf_asm), "+ ");
@@ -251,7 +250,7 @@ static int cb(RDiff *d, void *user, RDiffOp *op) {
 					free (bufasm);
 				} else {
 					char *bufasm = r_str_prefix_all (strdup (ac->buf_asm), Color_GREEN"+ ");
-					printf ("%s\n"Color_RESET, bufasm);
+					printf ("%s\n" Color_RESET, bufasm);
 					free (bufasm);
 				}
 				// r_asm_code_free (ac);
@@ -268,13 +267,135 @@ static int cb(RDiff *d, void *user, RDiffOp *op) {
 	return 0;
 }
 
+static ut64 gdiff_start = 0;
+
+void print_bytes(const void *p, size_t len, bool big_endian) {
+	size_t i;
+	for (i = 0; i < len; ++i) {
+		ut8 ch = ((ut8*) p)[big_endian ? (len - i - 1) : i];
+		write (1, &ch, 1);
+	}
+}
+
+static int bcb(RDiff *d, void *user, RDiffOp *op) {
+	ut64 offset_diff = op->a_off - gdiff_start;
+	unsigned char opcode;
+	unsigned short USAddr = 0;
+	int IAddr = 0;
+	unsigned char UCLen = 0;
+	unsigned short USLen = 0;
+	int ILen = 0;
+	
+	// we copy from gdiff_start to a_off
+	if (offset_diff > 0) {
+
+		// size for the position
+		if (gdiff_start <= USHRT_MAX) {
+			opcode = 249;
+			USAddr = (unsigned short) gdiff_start;
+		} else if (gdiff_start <= INT_MAX) {
+			opcode = 252;
+			IAddr = (int) gdiff_start;
+		} else {
+			opcode = 255;
+		}
+
+		// size for the length
+		if (opcode != 255 && offset_diff <= UCHAR_MAX) {
+			UCLen = (unsigned char) offset_diff;
+		} else if (opcode != 255 && offset_diff <= USHRT_MAX) {
+			USLen = (unsigned short) offset_diff;
+			opcode += 1;
+		} else if (opcode != 255 && offset_diff <= INT_MAX) {
+			ILen = (int) offset_diff;
+			opcode += 2;
+		} else if (offset_diff > INT_MAX) {
+			int times = offset_diff / INT_MAX;
+			int max = INT_MAX;
+			size_t i;
+			for (i = 0; i < times; i++) {
+				print_bytes (&opcode, sizeof (opcode), true);
+				// XXX this is overflowingly wrong
+				// XXX print_bytes (&gdiff_start + i * max, sizeof (gdiff_start), true);
+				print_bytes (&max, sizeof (max), true);
+			}
+		}
+
+		// print opcode for COPY
+		print_bytes (&opcode, sizeof (opcode), true);
+
+		// print position for COPY
+		if (opcode <= 251) {
+			print_bytes (&USAddr, sizeof (USAddr), true);
+		} else if (opcode < 255) {
+			print_bytes (&IAddr, sizeof (IAddr), true);
+		} else {
+			print_bytes (&gdiff_start, sizeof (gdiff_start), true);
+		}
+		
+		// print length for COPY
+		switch (opcode) {
+		case 249:
+		case 252:
+			print_bytes (&UCLen, sizeof (UCLen), true);
+			break;
+		case 250:
+		case 253:
+			print_bytes (&USLen, sizeof (USLen), true);
+			break;
+		case 251:
+		case 254:
+		case 255:
+			print_bytes (&ILen, sizeof (ILen), true);
+			break;
+		}
+	}
+	
+	// we append data
+	if (op->b_len <= 246) {
+		ut8 data = op->b_len;
+		write (1, &data, 1);
+	} else if (op->b_len <= USHRT_MAX) {
+		USLen = (ut16) op->b_len;
+		ut8 data = 247;
+		write (1, &data, 1);
+		print_bytes (&USLen, sizeof (USLen), true);
+	} else if (op->b_len <= INT_MAX) {
+		ut8 data = 248;
+		write (1, &data, 1);
+		ILen = (int) op->b_len;
+		print_bytes (&ILen, sizeof (ILen), true);
+	} else {
+		// split into multiple DATA, because op->b_len is greater than INT_MAX
+		int times = op->b_len / INT_MAX;
+		int max = INT_MAX;
+		size_t i;
+		for(i = 0;i < times; i++) {
+			ut8 data = 248;
+			write (1, &data, 1);
+			print_bytes (&max, sizeof (max), true);
+			print_bytes (op->b_buf, max, false);
+			op->b_buf += max;
+		}
+		op->b_len = op->b_len % max;
+
+		// print the remaining size
+		int remain_size = op->b_len;
+		print_bytes(&remain_size, sizeof(remain_size), true);
+	}
+	print_bytes(op->b_buf, op->b_len, false);
+	gdiff_start = op->b_off + op->b_len;
+	return 0;
+}
+
 static int show_help(int v) {
-	printf ("Usage: radiff2 [-abcCdjrspOxuUvV] [-A[A]] [-g sym] [-t %%] [file] [file]\n");
+	printf ("Usage: radiff2 [-abBcCdjrspOxuUvV] [-A[A]] [-g sym] [-t %%] [file] [file]\n");
 	if (v) {
 		printf (
 			"  -a [arch]  specify architecture plugin to use (x86, arm, ..)\n"
 			"  -A [-A]    run aaa or aaaa after loading each binary (see -C)\n"
 			"  -b [bits]  specify register size for arch (16 (thumb), 32, 64, ..)\n"
+			"  -B         output in binary diff (GDIFF)\n"
 			"  -c         count of changes\n"
 			"  -C         graphdiff code (columns: off-A, match-ratio, off-B) (see -A)\n"
 			"  -d         use delta diffing\n"
@@ -308,6 +429,7 @@ static void dump_cols(ut8 *a, int as, ut8 *b, int bs, int w) {
 	ut32 sz = R_MIN (as, bs);
 	ut32 i, j;
 	int ctx = DUMP_CONTEXT;
+	int pad = 0;
 	switch (w) {
 	case 8:
 		r_cons_printf ("  offset     0 1 2 3 4 5 6 7 01234567    0 1 2 3 4 5 6 7 01234567\n");
@@ -322,6 +444,10 @@ static void dump_cols(ut8 *a, int as, ut8 *b, int bs, int w) {
 		return;
 	}
 	for (i = 0; i < sz; i += w) {
+		if (i + w >= sz) {
+			pad = w - sz + i;
+			w = sz - i;
+		}
 		bool eq = !memcmp (a + i, b + i, w);
 		if (eq) {
 			ctx--;
@@ -349,6 +475,9 @@ static void dump_cols(ut8 *a, int as, ut8 *b, int bs, int w) {
 				r_cons_printf (Color_RESET);
 			}
 		}
+		for (j = 0; j < pad; j++) {
+			r_cons_printf ("  ");
+		}
 		r_cons_printf (" ");
 		for (j = 0; j < w; j++) {
 			bool eq2 = a[i + j] == b[i + j];
@@ -360,6 +489,9 @@ static void dump_cols(ut8 *a, int as, ut8 *b, int bs, int w) {
 				r_cons_printf (Color_RESET);
 			}
 		}
+		for (j = 0; j < pad; j++) {
+			r_cons_printf (" ");
+		}
 		r_cons_printf ("   ");
 		for (j = 0; j < w; j++) {
 			bool eq2 = a[i + j] == b[i + j];
@@ -370,6 +502,9 @@ static void dump_cols(ut8 *a, int as, ut8 *b, int bs, int w) {
 			if (!eq) {
 				r_cons_printf (Color_RESET);
 			}
+		}
+		for (j = 0; j < pad; j++) {
+			r_cons_printf ("  ");
 		}
 		r_cons_printf (" ");
 		for (j = 0; j < w; j++) {
@@ -547,7 +682,7 @@ int main(int argc, char **argv) {
 
 	evals = r_list_newf (NULL);
 
-	while ((o = getopt (argc, argv, "Aa:b:CDe:npg:G:OijrhcdsS:uUvVxt:zq")) != -1) {
+	while ((o = getopt (argc, argv, "Aa:b:BCDe:npg:G:OijrhcdsS:uUvVxt:zq")) != -1) {
 		switch (o) {
 		case 'a':
 			arch = optarg;
@@ -557,6 +692,9 @@ int main(int argc, char **argv) {
 			break;
 		case 'b':
 			bits = atoi (optarg);
+			break;
+		case 'B':
+			diffmode = 'B';
 			break;
 		case 'e':
 			r_list_append (evals, optarg);
@@ -668,6 +806,8 @@ int main(int argc, char **argv) {
 			eprintf ("Cannot open '%s'\n", r_str_get (file2));
 			return 1;
 		}
+		c->c2 = c2;
+		c2->c2 = c;
 		if (arch) {
 			r_config_set (c->config, "asm.arch", arch);
 			r_config_set (c2->config, "asm.arch", arch);
@@ -690,8 +830,8 @@ int main(int argc, char **argv) {
 				addr = "main";
 			}
 			/* should be in mode not in bool pdc */
-			r_config_set (c->config, "scr.color", "false");
-			r_config_set (c2->config, "scr.color", "false");
+			r_config_set_i (c->config, "scr.color", COLOR_MODE_DISABLED);
+			r_config_set_i (c2->config, "scr.color", COLOR_MODE_DISABLED);
 
 			ut64 addra = r_num_math (c->num, addr);
 			bufa = (ut8 *) r_core_cmd_strf (c, "af;pdc @ 0x%08"PFMT64x, addra);
@@ -702,22 +842,26 @@ int main(int argc, char **argv) {
 			szb = strlen ((const char *) bufb);
 			mode = MODE_DIFF;
 		} else if (mode == MODE_GRAPH) {
+			int depth = r_config_get_i (c->config, "anal.depth");
+			if (depth < 1) {
+				depth = 64;
+			}
 			char *words = strdup (addr? addr: "0");
 			char *second = strstr (words, ",");
 			if (second) {
 				*second++ = 0;
 				ut64 off = r_num_math (c->num, words);
 				// define the same function at each offset
-				r_core_anal_fcn (c, off, UT64_MAX, R_ANAL_REF_TYPE_NULL, 0);
+				r_core_anal_fcn (c, off, UT64_MAX, R_ANAL_REF_TYPE_NULL, depth);
 				r_core_anal_fcn (c2, r_num_math (c2->num, second),
-					UT64_MAX, R_ANAL_REF_TYPE_NULL, 0);
+					UT64_MAX, R_ANAL_REF_TYPE_NULL, depth);
 				r_core_gdiff (c, c2);
 				r_core_anal_graph (c, off, R_CORE_ANAL_GRAPHBODY | R_CORE_ANAL_GRAPHDIFF);
 			} else {
 				r_core_anal_fcn (c, r_num_math (c->num, words),
-					UT64_MAX, R_ANAL_REF_TYPE_NULL, 0);
+					UT64_MAX, R_ANAL_REF_TYPE_NULL, depth);
 				r_core_anal_fcn (c2, r_num_math (c2->num, words),
-					UT64_MAX, R_ANAL_REF_TYPE_NULL, 0);
+					UT64_MAX, R_ANAL_REF_TYPE_NULL, depth);
 				r_core_gdiff (c, c2);
 				r_core_anal_graph (c, r_num_math (c->num, addr),
 					R_CORE_ANAL_GRAPHBODY | R_CORE_ANAL_GRAPHDIFF);
@@ -781,8 +925,18 @@ int main(int argc, char **argv) {
 			printf ("\"}],\n");
 			printf ("\"changes\":[");
 		}
+		if (diffmode == 'B') {
+			write (1, "\xd1\xff\xd1\xff", 4);
+			write (1, "\x04", 1);
+		}
 		if (diffmode == 'U') {
-			r_diff_buffers_unified (d, bufa, sza, bufb, szb);
+			char * res = r_diff_buffers_unified (d, bufa, sza, bufb, szb);
+			printf ("%s", res);
+			free (res);
+		} else if (diffmode == 'B') {
+			r_diff_set_callback (d, &bcb, 0);
+			r_diff_buffers (d, bufa, sza, bufb, szb);
+			write (1, "\x00", 1);
 		} else {
 			r_diff_set_callback (d, &cb, 0); // (void *)(size_t)diffmode);
 			r_diff_buffers (d, bufa, sza, bufb, szb);

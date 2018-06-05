@@ -85,7 +85,7 @@ static RList *sections(RBinFile *bf) {
 	ptr->paddr = bf->buf->length - ptr->size;
 	ptr->vaddr = 0xf0000;
 	ptr->srwx = R_BIN_SCN_READABLE | R_BIN_SCN_WRITABLE |
-	            R_BIN_SCN_EXECUTABLE | R_BIN_SCN_MAP;
+	            R_BIN_SCN_EXECUTABLE;
 	ptr->add = true;
 	r_list_append (ret, ptr);
 	return ret;
@@ -123,7 +123,7 @@ RBinPlugin r_bin_plugin_bios = {
 };
 
 #ifndef CORELIB
-RlibStruct radare_plugin = {
+RLibStruct radare_plugin = {
 	.type = R_LIB_TYPE_BIN,
 	.data = &r_bin_plugin_bios,
 	.version = R2_VERSION

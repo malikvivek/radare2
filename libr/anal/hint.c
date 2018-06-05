@@ -56,12 +56,19 @@ static void setHint(RAnal *a, const char *type, ut64 addr, const char *s, ut64 p
 }
 
 R_API void r_anal_hint_set_offset(RAnal *a, ut64 addr, const char* typeoff) {
-	setHint (a, "Offset:", addr, r_str_trim_const (typeoff), 0);
+	setHint (a, "Offset:", addr, r_str_trim_ro (typeoff), 0);
 }
 
 R_API void r_anal_hint_set_jump(RAnal *a, ut64 addr, ut64 ptr) {
 	setHint (a, "jump:", addr, NULL, ptr);
 }
+
+R_API void r_anal_hint_set_newbits(RAnal *a, ut64 addr, int bits) {
+	a->bits_hints_changed = true;
+	setHint (a, "Bits:", addr, NULL, bits);
+}
+
+// TOOD: add helpers for newendian and newbank
 
 R_API void r_anal_hint_set_fail(RAnal *a, ut64 addr, ut64 ptr) {
 	setHint (a, "fail:", addr, NULL, ptr);
@@ -84,7 +91,7 @@ R_API void r_anal_hint_set_pointer(RAnal *a, ut64 addr, ut64 ptr) {
 }
 
 R_API void r_anal_hint_set_arch(RAnal *a, ut64 addr, const char *arch) {
-	setHint (a, "arch:", addr, r_str_trim_const (arch), 0);
+	setHint (a, "arch:", addr, r_str_trim_ro (arch), 0);
 }
 
 R_API void r_anal_hint_set_syntax(RAnal *a, ut64 addr, const char *syn) {
@@ -92,11 +99,11 @@ R_API void r_anal_hint_set_syntax(RAnal *a, ut64 addr, const char *syn) {
 }
 
 R_API void r_anal_hint_set_opcode(RAnal *a, ut64 addr, const char *opcode) {
-	setHint (a, "opcode:", addr, r_str_trim_const (opcode), 0);
+	setHint (a, "opcode:", addr, r_str_trim_ro (opcode), 0);
 }
 
 R_API void r_anal_hint_set_esil(RAnal *a, ut64 addr, const char *esil) {
-	setHint (a, "esil:", addr, r_str_trim_const (esil), 0);
+	setHint (a, "esil:", addr, r_str_trim_ro (esil), 0);
 }
 
 R_API void r_anal_hint_set_bits(RAnal *a, ut64 addr, int bits) {
@@ -193,6 +200,7 @@ R_API RAnalHint *r_anal_hint_from_string(RAnal *a, ut64 addr, const char *str) {
 			case 'f': hint->fail = sdb_atoi (nxt); break;
 			case 'p': hint->ptr  = sdb_atoi (nxt); break;
 			case 'b': hint->bits = sdb_atoi (nxt); break;
+			case 'B': hint->new_bits = sdb_atoi (nxt); break;
 			case 's': hint->size = sdb_atoi (nxt); break;
 			case 'S': hint->syntax = (char*)sdb_decode (nxt, 0); break;
 			case 'o': hint->opcode = (char*)sdb_decode (nxt, 0); break;

@@ -29,6 +29,8 @@ static int check_features(RAsm *a, cs_insn *insn);
 
 #include "cs_mnemonics.c"
 
+#include "asm_x86_vm.c"
+
 static int disassemble(RAsm *a, RAsmOp *op, const ut8 *buf, int len) {
 	static int omode = 0;
 	int mode, ret;
@@ -70,11 +72,10 @@ static int disassemble(RAsm *a, RAsmOp *op, const ut8 *buf, int len) {
 	} else {
 		cs_option (cd, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
 	}
-	if (op) {
-		op->size = 1;
-	} else {
+	if (!op) {
 		return true;
 	}
+	op->size = 1;
 	cs_insn *insn = NULL;
 #if USE_ITER_API
 	{
@@ -102,7 +103,7 @@ static int disassemble(RAsm *a, RAsmOp *op, const ut8 *buf, int len) {
 			strcpy (op->buf_asm, "illegal");
 		}
 	}
-	if (op->size==0 && n>0 && insn->size>0) {
+	if (op->size == 0 && n > 0 && insn->size > 0) {
 		char *ptrstr;
 		op->size = insn->size;
 		snprintf (op->buf_asm, R_ASM_BUFSIZE, "%s%s%s",
@@ -112,6 +113,8 @@ static int disassemble(RAsm *a, RAsmOp *op, const ut8 *buf, int len) {
 		if (ptrstr) {
 			memmove (ptrstr, ptrstr + 4, strlen (ptrstr + 4) + 1);
 		}
+	} else {
+		decompile_vm (a, op, buf, len);
 	}
 	if (a->syntax == R_ASM_SYNTAX_JZ) {
 		if (!strncmp (op->buf_asm, "je ", 3)) {

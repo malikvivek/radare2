@@ -107,7 +107,7 @@ static int set_name(RFlagItem *item, const char *name) {
 	if (!item->name) {
 		return false;
 	}
-	r_str_chop (item->name);
+	r_str_trim (item->name);
 	r_name_filter (item->name, 0); // TODO: name_filter should be chopping already
 	free (item->realname);
 	item->realname = item->name;
@@ -130,6 +130,7 @@ R_API RFlag * r_flag_new() {
 #else
 	f->zones = NULL;
 #endif
+	f->tags = sdb_new0 ();
 	f->flags = r_list_new ();
 	if (!f->flags) {
 		r_flag_free (f);
@@ -153,6 +154,27 @@ R_API RFlag * r_flag_new() {
 		f->spaces[i] = NULL;
 	}
 	return f;
+}
+
+R_API RFlagItem *r_flag_item_clone(RFlagItem *item) {
+	if (!item) {
+		return NULL;
+	}
+
+	RFlagItem *n = R_NEW0 (RFlagItem);
+	if (!n) {
+		return NULL;
+	}
+
+	n->color = item->color ? strdup (item->color) : NULL;
+	n->comment = item->comment ? strdup (item->comment) : NULL;
+	n->alias = item->alias ? strdup (item->alias) : NULL;
+	n->name = item->name ? strdup (item->name) : NULL;
+	n->realname = item->realname ? strdup (item->realname) : NULL;
+	n->offset = item->offset;
+	n->size = item->size;
+	n->space = item->space;
+	return n;
 }
 
 R_API void r_flag_item_free(RFlagItem *item) {

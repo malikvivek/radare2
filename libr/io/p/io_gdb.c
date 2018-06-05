@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2010-2017 pancake */
+/* radare - LGPL - Copyright 2010-2018 pancake */
 
 #include <r_io.h>
 #include <r_lib.h>
@@ -15,6 +15,7 @@ typedef struct {
 
 #define R_GDB_MAGIC r_str_hash ("gdb")
 
+static int __close(RIODesc *fd);
 static libgdbr_t *desc = NULL;
 static RIODesc *riogdb = NULL;
 
@@ -114,6 +115,8 @@ static RIODesc *__open(RIO *io, const char *file, int rw, int mode) {
 	gdbr_init (&riog->desc, false);
 
 	if (gdbr_connect (&riog->desc, host, i_port) == 0) {
+		__close (NULL);
+		// R_FREE (desc);
 		desc = &riog->desc;
 		if (pid > 0) { // FIXME this is here for now because RDebug's pid and libgdbr's aren't properly synced.
 			desc->pid = i_pid;
@@ -138,8 +141,10 @@ static RIODesc *__open(RIO *io, const char *file, int rw, int mode) {
 
 static int __write(RIO *io, RIODesc *fd, const ut8 *buf, int count) {
 	ut64 addr = io->off;
-	if (!desc || !desc->data) return -1;
-	return debug_gdb_write_at(buf, count, addr);
+	if (!desc || !desc->data) {
+		return -1;
+	}
+	return debug_gdb_write_at (buf, count, addr);
 }
 
 static ut64 __lseek(RIO *io, RIODesc *fd, ut64 offset, int whence) {
@@ -174,11 +179,12 @@ static int __close(RIODesc *fd) {
 	}
 	gdbr_disconnect (desc);
 	gdbr_cleanup (desc);
-	free (desc);
+	R_FREE (desc);
 	return -1;
 }
 
 static int __getpid(RIODesc *fd) {
+	// XXX dont use globals
 	return desc ? desc->pid : -1;
 #if 0
 	// dupe for ? r_io_desc_get_pid (desc);
@@ -222,7 +228,7 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
 		return NULL;
 	}
 	if (r_str_startswith (cmd, "pktsz")) {
-		const char *ptr = r_str_chop_ro (cmd + 5);
+		const char *ptr = r_str_trim_ro (cmd + 5);
 		if (!isdigit (*ptr)) {
 			io->cb_printf ("packet size: %u bytes\n",
 				       desc->stub_features.pkt_sz);
@@ -242,7 +248,7 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
 			res = gdbr_detach (desc) >= 0;
 		} else {
 			int pid = 0;
-			cmd = r_str_chop_ro (cmd + 6);
+			cmd = r_str_trim_ro (cmd + 6);
 			if (!*cmd || !(pid = strtoul (cmd, NULL, 10))) {
 				res = gdbr_detach (desc) >= 0;
 			} else {
@@ -256,7 +262,7 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
 		if (send_msg (desc, cmd + 4) == -1) {
 			return NULL;
 		}
-		int r = read_packet (desc);
+		(void)read_packet (desc);
 		desc->data[desc->data_len] = '\0';
 		io->cb_printf ("reply:\n%s\n", desc->data);
 		if (!desc->no_ack) {
@@ -318,7 +324,7 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
 			}
 			return NULL;
 		}
-		io->cb_printf ("num_retries: %d bytes\n", desc->page_size);
+		io->cb_printf ("num_retries: %d byte(s)\n", desc->page_size);
 		return NULL;
 	}
 	if (r_str_startswith (cmd, "page_size")) {
@@ -329,7 +335,7 @@ static char *__system(RIO *io, RIODesc *fd, const char *cmd) {
 			}
 			return NULL;
 		}
-		io->cb_printf ("page size: %d bytes\n", desc->page_size);
+		io->cb_printf ("page size: %d byte(s)\n", desc->page_size);
 		return NULL;
 	}
 	// Sets a flag that next call to get memmap will be for getting baddr

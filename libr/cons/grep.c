@@ -1,14 +1,9 @@
-/* radare - LGPL - Copyright 2009-2017 - pancake, nibble */
+/* radare - LGPL - Copyright 2009-2018 - pancake, nibble */
 
 #include <r_cons.h>
 #include <r_util.h>
 #include <r_print.h>
 #include <sdb.h>
-#undef SDB_API
-#define SDB_API static
-#include "../../shlr/sdb/src/json/rangstr.c"
-int js0n(const ut8 *js, RangstrType len, RangstrType *out);
-#include "../../shlr/sdb/src/json/path.c"
 
 #define I(x) r_cons_singleton ()->x
 
@@ -144,6 +139,8 @@ static void parse_grep_expression(const char *str) {
 			if (first) {
 				str++;
 				cons->grep.icase = 1;
+			} else {
+				goto while_end;
 			}
 			break;
 		case '^':
@@ -214,6 +211,7 @@ while_end:
 			case '-':
 				is_range = 1;
 				num_is_parsed = 0;
+				range_end = -1;
 				break;
 			case ']':  // fallthrough to handle ']' like ','
 			case ',':
@@ -225,13 +223,23 @@ while_end:
 					cons->grep.tokens[range_begin] = 1;
 					cons->grep.tokens_used = 1;
 				}
-				is_range = 0;
-				num_is_parsed = 0;
+				// case of [n-]
+				if (*ptr2 == ']' && is_range && !num_is_parsed) {
+					num_is_parsed = 1;
+					range_end = -1;
+				} else {
+					is_range = 0;
+					num_is_parsed = 0;
+				}
 				break;
 			default:
 				if (!num_is_parsed) {
 					if (is_range) {
 						range_end = r_num_get (cons->num, ptr2);
+						// check for bad value, if range_end == 0, we check if ptr2 == '0'
+						if (range_end == 0 && *ptr != '0') {
+							range_end = -1; // this allow [n- ]
+						}
 					} else {
 						range_begin = range_end = r_num_get (cons->num, ptr2);
 					}
@@ -372,17 +380,34 @@ R_API void r_cons_grep_parsecmd(char *cmd, const char *quotestr) {
 	ptr = preprocess_filter_expr (cmd, quotestr);
 
 	if (ptr) {
-		r_str_chop (cmd);
+		r_str_trim (cmd);
 		parse_grep_expression (ptr);
 		free (ptr);
+	}
+}
+
+R_API char * r_cons_grep_strip(char *cmd, const char *quotestr) {
+	char *ptr = NULL;
+
+	if (cmd) {
+		ptr = preprocess_filter_expr (cmd, quotestr);
+		r_str_trim (cmd);
+	}
+	return ptr;
+}
+
+R_API void r_cons_grep_process(char * grep) {
+	if (grep) {
+		parse_grep_expression (grep);
+		free (grep);
 	}
 }
 
 static int cmp(const void *a, const void *b) {
 	char *da = NULL;
 	char *db = NULL;
-	const char *ca = r_str_chop_ro (a);
-	const char *cb = r_str_chop_ro (b);
+	const char *ca = r_str_trim_ro (a);
+	const char *cb = r_str_trim_ro (b);
 	if (!a || !b) {
 		return (int) (size_t) ((char*) a - (char*) b);
 	}
@@ -432,8 +457,7 @@ R_API int r_cons_grepbuf(char *buf, int len) {
 	}
 	if (cons->grep.json) {
 		if (cons->grep.json_path) {
-			Rangstr rs = json_get (cons->buffer, cons->grep.json_path);
-			char *u = rangstr_dup (&rs);
+			char *u = sdb_json_get_str (cons->buffer, cons->grep.json_path);
 			if (u) {
 				cons->buffer = u;
 				cons->buffer_len = strlen (u);
@@ -451,7 +475,7 @@ R_API int r_cons_grepbuf(char *buf, int len) {
 				Color_RESET,
 				NULL
 			};
-			char *out = r_print_json_indent (buf, I (use_color), "  ", palette);
+			char *out = r_print_json_indent (buf, I (color), "  ", palette);
 			if (!out) {
 				return 0;
 			}
@@ -536,7 +560,11 @@ R_API int r_cons_grepbuf(char *buf, int len) {
 		l = p - in;
 		if (l > 0) {
 			memcpy (tline, in, l);
-			tl = r_str_ansi_filter (tline, NULL, NULL, l);
+			if (cons->grep_color) {
+				tl = l;
+			} else {
+				tl = r_str_ansi_filter (tline, NULL, NULL, l);
+			}
 			if (tl < 0) {
 				ret = -1;
 			} else {
@@ -856,14 +884,14 @@ R_API char *r_cons_html_filter(const char *ptr, int *newlen) {
 				esc = 0;
 				str = ptr;
 				continue;
-			} else if (!strncmp (ptr, "48;5;", 5)) {
+			} else if (!strncmp (ptr, "48;5;", 5) || !strncmp (ptr, "48;2;", 5)) {
 				char *end = strchr (ptr, 'm');
 				r_strbuf_appendf (res, "<font style='background-color:%s'>", gethtmlrgb (ptr));
 				tag_font = true;
 				ptr = end;
 				str = ptr + 1;
 				esc = 0;
-			} else if (!strncmp (ptr, "38;5;", 5)) {
+			} else if (!strncmp (ptr, "38;5;", 5) || !strncmp (ptr, "38;2;", 5)) {
 				char *end = strchr (ptr, 'm');
 				r_strbuf_appendf (res, "<font color='%s'>", gethtmlrgb (ptr));
 				tag_font = true;
@@ -918,11 +946,3 @@ R_API char *r_cons_html_filter(const char *ptr, int *newlen) {
 	return r_strbuf_drain (res);
 }
 
-R_API int r_cons_html_print(const char *ptr) {
-	char *res = r_cons_html_filter (ptr, NULL);
-	int res_len = strlen (res);
-	printf ("%s", res);
-	fflush (stdout);
-	free (res);
-	return res_len;
-}

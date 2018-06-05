@@ -1,4 +1,4 @@
-/* radare - LGPL - Copyright 2009-2017 - nibble, pancake */
+/* radare - LGPL - Copyright 2009-2018 - nibble, pancake */
 
 #include <getopt.c>
 #include <r_core.h>
@@ -95,6 +95,7 @@ static int rabin_show_help(int v) {
 		" RABIN2_DEBASE64:  e bin.debase64     # try to debase64 all strings\n"
 		" RABIN2_DMNGLRCMD: e bin.demanglercmd # try to purge false positives\n"
 		" RABIN2_PDBSERVER: e pdb.server       # use alternative PDB server\n"
+		" RABIN2_SYMSTORE:  e pdb.symstore     # path to downstream symbol store\n"
 		" RABIN2_PREFIX:    e bin.prefix       # prefix symbols/sections/relocs with a specific string\n");
 	}
 	return 1;
@@ -149,8 +150,7 @@ static bool extract_binobj(const RBinFile *bf, RBinXtrData *data, int idx) {
 	int bits = 0;
 	char *libname = NULL;
 	const char *filename = bf ? bf->file : NULL;
-	char *path = NULL, *outpath = NULL, *outfile = NULL, *ptr = NULL;
-	ut32 outfile_sz = 0, outpath_sz = 0;
+	char *path = NULL, *ptr = NULL;
 	bool res = false;
 
 	if (!bf || !data || !filename) {
@@ -184,14 +184,7 @@ static bool extract_binobj(const RBinFile *bf, RBinXtrData *data, int idx) {
 	} else {
 		ptr = path;
 	}
-	outpath_sz = strlen (path) + 20;
-	if (outpath_sz > 0) {
-		outpath = malloc (outpath_sz);
-	}
-
-	if (outpath) {
-		snprintf (outpath, outpath_sz, "%s.fat", ptr);
-	}
+	char *outpath = r_str_newf ("%s.fat", ptr);
 	if (!outpath || !r_sys_mkdirp (outpath)) {
 		free (path);
 		free (outpath);
@@ -199,20 +192,9 @@ static bool extract_binobj(const RBinFile *bf, RBinXtrData *data, int idx) {
 		return false;
 	}
 
-	outfile_sz = outpath_sz + strlen (ptr) + strlen (arch) + 23;
-	if (outfile_sz) {
-		outfile = malloc (outfile_sz);
-	}
-
-	if (outfile) {
-		if (libname) {
-			snprintf (outfile, outfile_sz, "%s/%s.%s.%s_%i.%d",
-					  outpath, ptr, arch, libname, bits, idx);
-		} else {
-			snprintf (outfile, outfile_sz, "%s/%s.%s_%i.%d",
-					  outpath, ptr, arch, bits, idx);
-		}
-	}
+	char *outfile = libname
+		? r_str_newf ("%s/%s.%s.%s_%i.%d", outpath, ptr, arch, libname, bits, idx)
+		: r_str_newf ("%s/%s.%s_%i.%d", outpath, ptr, arch, bits, idx);
 
 	if (!outfile || !r_file_dump (outfile, bytes, bin_size, 0)) {
 		eprintf ("Error extracting %s\n", outfile);
@@ -276,16 +258,19 @@ static int rabin_dump_symbols(int len) {
 		} else {
 			len = olen;
 		}
-		if (!(buf = malloc (len))) {
+		if (!(buf = calloc (1, len))) {
 			return false;
 		}
-		if (!(ret = malloc (len * 2 + 1))) {
+		if (!(ret = malloc ((len * 2) + 1))) {
 			free (buf);
 			return false;
 		}
-		r_buf_read_at (bin->cur->buf, symbol->paddr, buf, len);
-		r_hex_bin2str (buf, len, ret);
-		printf ("%s %s\n", symbol->name, ret);
+		if (r_buf_read_at (bin->cur->buf, symbol->paddr, buf, len) == len) {
+			r_hex_bin2str (buf, len, ret);
+			printf ("%s %s\n", symbol->name, ret);
+		} else {
+			eprintf ("Cannot read from buffer\n");
+		}
 		free (buf);
 		free (ret);
 	}
@@ -483,26 +468,38 @@ static int rabin_show_srcline(ut64 at) {
 }
 
 /* bin callback */
-static int __lib_bin_cb(struct r_lib_plugin_t *pl, void *user, void *data) {
+static int __lib_bin_cb(RLibPlugin *pl, void *user, void *data) {
 	struct r_bin_plugin_t *hand = (struct r_bin_plugin_t *)data;
 	//printf(" * Added (dis)assembly plugin\n");
 	r_bin_add (bin, hand);
 	return true;
 }
 
-static int __lib_bin_dt(struct r_lib_plugin_t *pl, void *p, void *u) {
+static int __lib_bin_dt(RLibPlugin *pl, void *p, void *u) {
 	return true;
 }
 
 /* binxtr callback */
-static int __lib_bin_xtr_cb(struct r_lib_plugin_t *pl, void *user, void *data) {
+static int __lib_bin_xtr_cb(RLibPlugin *pl, void *user, void *data) {
 	struct r_bin_xtr_plugin_t *hand = (struct r_bin_xtr_plugin_t *)data;
 	//printf(" * Added (dis)assembly plugin\n");
 	r_bin_xtr_add (bin, hand);
 	return true;
 }
 
-static int __lib_bin_xtr_dt(struct r_lib_plugin_t *pl, void *p, void *u) {
+static int __lib_bin_xtr_dt(RLibPlugin *pl, void *p, void *u) {
+	return true;
+}
+
+/* binldr callback */
+static int __lib_bin_ldr_cb(RLibPlugin *pl, void *user, void *data) {
+	struct r_bin_ldr_plugin_t *hand = (struct r_bin_ldr_plugin_t *)data;
+	//printf(" * Added (dis)assembly plugin\n");
+	r_bin_ldr_add (bin, hand);
+	return true;
+}
+
+static int __lib_bin_ldr_dt(RLibPlugin *pl, void *p, void *u) {
 	return true;
 }
 
@@ -549,7 +546,6 @@ int main(int argc, char **argv) {
 	const char *op = NULL;
 	const char *path = NULL;
 	RCoreBinFilter filter;
-	RCoreFile *cf = NULL;
 	int xtr_idx = 0; // load all files if extraction is necessary.
 	int rawstr = 0;
 	int fd = -1;
@@ -559,13 +555,17 @@ int main(int argc, char **argv) {
 	bin = core.bin;
 
 	if (!(tmp = r_sys_getenv ("RABIN2_NOPLUGINS"))) {
-		char *homeplugindir = r_str_home (R2_HOMEDIR "/plugins");
+		char *homeplugindir = r_str_home (R2_HOME_PLUGINS);
+		char *plugindir = r_str_r2_prefix (R2_PLUGINS);
+		char *extrasdir = r_str_r2_prefix (R2_EXTRAS);
+		char *bindingsdir = r_str_r2_prefix (R2_BINDINGS);
 		l = r_lib_new ("radare_plugin");
-	
 		r_lib_add_handler (l, R_LIB_TYPE_BIN, "bin plugins",
-		  &__lib_bin_cb, &__lib_bin_dt, NULL);
+			&__lib_bin_cb, &__lib_bin_dt, NULL);
 		r_lib_add_handler (l, R_LIB_TYPE_BIN_XTR, "bin xtr plugins",
-		  &__lib_bin_xtr_cb, &__lib_bin_xtr_dt, NULL);
+			&__lib_bin_xtr_cb, &__lib_bin_xtr_dt, NULL);
+		r_lib_add_handler (l, R_LIB_TYPE_BIN_LDR, "bin ldr plugins",
+			&__lib_bin_ldr_cb, &__lib_bin_ldr_dt, NULL);
 		/* load plugins everywhere */
 
 		path = r_sys_getenv (R_LIB_ENV);
@@ -573,10 +573,13 @@ int main(int argc, char **argv) {
 			r_lib_opendir (l, path);
 		}
 		r_lib_opendir (l, homeplugindir);
+		r_lib_opendir (l, plugindir);
+		r_lib_opendir (l, extrasdir);
+		r_lib_opendir (l, bindingsdir);
 		free (homeplugindir);
-		r_lib_opendir (l, R2_LIBDIR "/radare2/" R2_VERSION);
-		r_lib_opendir (l, R2_LIBDIR "/radare2-extras/" R2_VERSION);
-		r_lib_opendir (l, R2_LIBDIR "/radare2-bindings/" R2_VERSION);
+		free (plugindir);
+		free (extrasdir);
+		free (bindingsdir);
 	}
 	free (tmp);
 
@@ -723,15 +726,15 @@ int main(int argc, char **argv) {
 			op = optarg;
 			set_action (R_BIN_REQ_OPERATION);
 			if (isBinopHelp (op)) {
-				printf ("Operation string:\n"
-					"  Change Entrypoint: e/0x8048000\n"
-					"  Dump Symbols: d/s/1024\n"
-					"  Dump Section: d/S/.text\n"
-					"  Resize Section: r/.data/1024\n"
-					"  Remove RPATH: R\n"
-					"  Add Library: a/l/libfoo.dylib\n"
-					"  Change Permissions: p/.data/rwx\n"
-					"  Show LDID entitlements: C\n");
+				printf ("Usage: iO [expression]:\n"
+					" e/0x8048000       change entrypoint\n"
+					" d/s/1024          dump symbols\n"
+					" d/S/.text         dump section\n"
+					" r/.data/1024      resize section\n"
+					" R                 remove RPATH\n"
+					" a/l/libfoo.dylib  add library\n"
+					" p/.data/rwx       change section permissions\n"
+					" C                 show LDID entitlements\n");
 				r_core_fini (&core);
 				return 0;
 			}
@@ -907,6 +910,15 @@ int main(int argc, char **argv) {
 	}
 
 	if (file && *file && action & R_BIN_REQ_DLOPEN) {
+#if __UNIX__
+		int child = r_sys_fork ();
+		if (child == -1) {
+			return 1;
+		}
+		if (child == 0) {
+			return waitpid (child, NULL, 0);
+		}
+#endif
 		void *addr = r_lib_dl_open (file);
 		if (addr) {
 			eprintf ("%s is loaded at 0x%"PFMT64x"\n", file, (ut64)(size_t)(addr));
@@ -914,7 +926,7 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		eprintf ("Cannot open the '%s' library\n", file);
-		return 1;
+		return 0;
 	}
 	if (action & R_BIN_REQ_PACKAGE) {
 		RList *files = r_list_newf (NULL);
@@ -946,12 +958,13 @@ int main(int argc, char **argv) {
 	}
 
 	if (file && *file) {
-		cf = r_core_file_open (&core, file, R_IO_READ, 0);
-		fd = cf ? r_core_file_cur_fd (&core) : -1;
-		if (!cf || fd == -1) {
-			eprintf ("r_core: Cannot open file '%s'\n", file);
-			r_core_fini (&core);
-			return 1;
+		if (r_core_file_open (&core, file, R_IO_READ, 0)) {
+			fd = r_io_fd_get_current (core.io);
+			if (fd == -1) {
+				eprintf ("r_core: Cannot open file '%s'\n", file);
+				r_core_fini (&core);
+				return 1;
+			}
 		}
 	}
 	bin->minstrlen = r_config_get_i (core.config, "bin.minstr");
@@ -976,7 +989,11 @@ int main(int argc, char **argv) {
 	}
 	if (rawstr == 2) {
 		rawstr = false;
-		r_bin_dump_strings (core.bin->cur, bin->minstrlen);
+		RBinFile *bf = r_core_bin_cur (&core);
+		if (bf) {
+			bf->strmode = rad;
+			r_bin_dump_strings (bf, bin->minstrlen);
+		}
 	}
 	if (query) {
 		if (rad) {
@@ -1027,6 +1044,12 @@ int main(int argc, char **argv) {
 		pdbopts.user_agent = (char*) r_config_get (core.config, "pdb.useragent");
 		pdbopts.symbol_server = (char*) r_config_get (core.config, "pdb.server");
 		pdbopts.extract = r_config_get_i (core.config, "pdb.extract");
+
+		if ((tmp = r_sys_getenv ("RABIN2_SYMSTORE"))) {
+			r_config_set (core.config, "pdb.symstore", tmp);
+			R_FREE (tmp);
+		}
+		pdbopts.symbol_store_path = (char*) r_config_get (core.config, "pdb.symstore");
 		int r = r_bin_pdb_download (&core, isradjson, &actions_done, &pdbopts);
 		r_core_fini (&core);
 		return r;
@@ -1074,7 +1097,7 @@ int main(int argc, char **argv) {
 		rabin_do_operation (op);
 	}
 	if (isradjson) {
-		printf ("}");
+		r_cons_print ("}");
 	}
 	r_cons_flush ();
 	r_core_fini (&core);

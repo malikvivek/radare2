@@ -4,6 +4,9 @@
 #define R2_IO_H
 
 #include "r_list.h"
+#include <r_util/r_idpool.h>
+#include <r_util/r_cache.h>
+#include <r_util/r_buf.h>
 #include "r_socket.h"
 #include "r_util.h"
 #include "r_vector.h"
@@ -57,7 +60,6 @@ typedef struct r_io_undo_w_t {
 
 typedef struct r_io_t {
 	struct r_io_desc_t *desc;
-	int ret; // number of bytes read or written
 	ut64 off;
 	int bits;
 	int va;		//all of this config stuff must be in 1 int
@@ -67,6 +69,7 @@ typedef struct r_io_t {
 	int aslr;
 	int autofd;
 	int cached;
+	bool cachemode; // write in cache all the read operations (EXPERIMENTAL)
 	int p_cache;
 	int buffer_enabled;
 	int debug;
@@ -79,6 +82,7 @@ typedef struct r_io_t {
 	RIDStorage *files;
 	RCache *buffer;
 	RList *cache;	//sdblist?
+	RBNode cacheTree;
 	ut8 *write_mask;
 	int write_mask_len;
 	RIOUndo undo;
@@ -163,14 +167,14 @@ typedef struct r_io_map_t {
 	int fd;
 	int flags;
 	ut32 id;
-	RAddrInterval itv;
+	RInterval itv;
 	ut64 delta; //this delta means paddr when talking about section
 	char *name;
 } RIOMap;
 
 typedef struct r_io_map_skyline_t {
 	RIOMap *map;
-	RAddrInterval itv;
+	RInterval itv;
 } RIOMapSkyline;
 
 typedef struct r_io_section_t {
@@ -196,9 +200,7 @@ typedef enum {
 } RIOSectionApplyMethod;
 
 typedef struct r_io_cache_t {
-	ut64 from;
-	ut64 to;
-	int size;
+	RInterval itv;
 	ut8 *data;
 	ut8 *odata;
 	int written;
@@ -249,10 +251,13 @@ typedef int (*RIOFdReadAt) (RIO *io, int fd, ut64 addr, ut8 *buf, int len);
 typedef int (*RIOFdWriteAt) (RIO *io, int fd, ut64 addr, const ut8 *buf, int len);
 typedef bool (*RIOFdIsDbg) (RIO *io, int fd);
 typedef const char *(*RIOFdGetName) (RIO *io, int fd);
+typedef RList *(*RIOFdGetMap) (RIO *io, int fd);
+typedef bool (*RIOFdRemap) (RIO *io, int fd, ut64 addr);
 typedef void (*RIOAlSort) (RIOAccessLog *log);
 typedef void (*RIOAlFree) (RIOAccessLog *log);
 typedef ut8 *(*RIOAlGetFbufByflags) (RIOAccessLog *log, int flags, ut64 *addr, int *len);
 typedef bool (*RIOIsValidOff) (RIO *io, ut64 addr, int hasperm);
+typedef bool (*RIOAddrIsMapped) (RIO *io, ut64 addr);
 typedef SdbList *(*RIOSectionVgetSecsAt) (RIO *io, ut64 vaddr);
 typedef RIOSection *(*RIOSectionVgetSec) (RIO *io, ut64 vaddr);
 typedef RIOSection *(*RIOSectionAdd) (RIO *io, ut64 addr, ut64 vaddr, ut64 size, ut64 vsize, int rwx, const char *name, ut32 bin_id, int fd);
@@ -280,10 +285,13 @@ typedef struct r_io_bind_t {
 	RIOFdWriteAt fd_write_at;
 	RIOFdIsDbg fd_is_dbg;
 	RIOFdGetName fd_get_name;
+	RIOFdGetMap fd_get_map;
+	RIOFdRemap fd_remap;
 	RIOAlSort al_sort;	//needed for esil
 	RIOAlFree al_free;	//needed for esil
 	RIOAlGetFbufByflags al_buf_byflags;	//needed for esil
 	RIOIsValidOff is_valid_offset;
+	RIOAddrIsMapped addr_is_mapped;
 	RIOSectionVgetSecsAt sections_vget;
 	RIOSectionVgetSec sect_vget;
 	RIOSectionAdd section_add;
@@ -293,6 +301,7 @@ typedef struct r_io_bind_t {
 R_API RIOMap *r_io_map_new (RIO *io, int fd, int flags, ut64 delta, ut64 addr, ut64 size, bool do_skyline);
 R_API void r_io_map_init (RIO *io);
 R_API bool r_io_map_remap (RIO *io, ut32 id, ut64 addr);
+R_API bool r_io_map_remap_fd (RIO *io, int fd, ut64 addr);
 R_API bool r_io_map_exists (RIO *io, RIOMap *map);
 R_API bool r_io_map_exists_for_id (RIO *io, ut32 id);
 R_API RIOMap *r_io_map_resolve (RIO *io, ut32 id);
@@ -321,16 +330,18 @@ R_API RIODesc *r_io_open_nomap (RIO *io, const char *uri, int flags, int mode);	
 R_API RIODesc *r_io_open (RIO *io, const char *uri, int flags, int mode);
 R_API RIODesc *r_io_open_at (RIO *io, const char *uri, int flags, int mode, ut64 at);
 R_API RList *r_io_open_many (RIO *io, const char *uri, int flags, int mode);
+R_API RIODesc* r_io_open_buffer (RIO *io, RBuffer *b, int flags, int mode);
 R_API bool r_io_close (RIO *io);
 R_API bool r_io_reopen (RIO *io, int fd, int flags, int mode);
 R_API int r_io_close_all (RIO *io);
 R_API int r_io_pread_at (RIO *io, ut64 paddr, ut8 *buf, int len);
 R_API int r_io_pwrite_at (RIO *io, ut64 paddr, const ut8 *buf, int len);
-R_API bool r_io_vread_at (RIO *io, ut64 vaddr, ut8 *buf, int len);
-R_API bool r_io_vwrite_at (RIO *io, ut64 vaddr, const ut8 *buf, int len);
+R_API bool r_io_vread_at_mapped(RIO* io, ut64 vaddr, ut8* buf, int len);
 R_API RIOAccessLog *r_io_al_vread_at (RIO *io, ut64 vaddr, ut8 *buf, int len);
 R_API RIOAccessLog *r_io_al_vwrite_at (RIO *io, ut64 vaddr, const ut8 *buf, int len);
 R_API bool r_io_read_at (RIO *io, ut64 addr, ut8 *buf, int len);
+R_API bool r_io_read_at_mapped(RIO *io, ut64 addr, ut8 *buf, int len);
+R_API int r_io_nread_at (RIO *io, ut64 addr, ut8 *buf, int len);
 R_API RIOAccessLog *r_io_al_read_at (RIO *io, ut64 addr, ut8 *buf, int len);
 R_API void r_io_alprint(RList *ls);
 R_API bool r_io_write_at (RIO *io, ut64 addr, const ut8 *buf, int len);
@@ -357,6 +368,10 @@ R_API int r_io_plugin_generate(RIO *io);
 R_API bool r_io_plugin_add(RIO *io, RIOPlugin *plugin);
 R_API int r_io_plugin_list(RIO *io);
 R_API int r_io_plugin_list_json(RIO *io);
+R_API int r_io_plugin_read(RIODesc *desc, ut8 *buf, int len);
+R_API int r_io_plugin_write(RIODesc *desc, const ut8 *buf, int len);
+R_API int r_io_plugin_read_at(RIODesc *desc, ut64 addr, ut8 *buf, int len);
+R_API int r_io_plugin_write_at(RIODesc *desc, ut64 addr, const ut8 *buf, int len);
 R_API RIOPlugin *r_io_plugin_resolve(RIO *io, const char *filename, bool many);
 R_API RIOPlugin *r_io_plugin_resolve_fd(RIO *io, int fd);
 R_API RIOPlugin *r_io_plugin_get_default(RIO *io, const char *filename, bool many);
@@ -409,6 +424,7 @@ R_API bool r_io_desc_fini (RIO *io);
 
 /* io/cache.c */
 R_API int r_io_cache_invalidate(RIO *io, ut64 from, ut64 to);
+R_API bool r_io_cache_at(RIO *io, ut64 addr);
 R_API void r_io_cache_commit(RIO *io, ut64 from, ut64 to);
 R_API void r_io_cache_init(RIO *io);
 R_API int r_io_cache_list(RIO *io, int rad);
@@ -527,6 +543,7 @@ extern RIOPlugin r_io_plugin_null;
 extern RIOPlugin r_io_plugin_ar;
 extern RIOPlugin r_io_plugin_rbuf;
 extern RIOPlugin r_io_plugin_winedbg;
+extern RIOPlugin r_io_plugin_gprobe;
 
 #if __cplusplus
 }

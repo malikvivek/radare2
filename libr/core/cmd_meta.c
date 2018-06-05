@@ -1,4 +1,4 @@
-/* radare2 - LGPL - Copyright 2009-2017 - pancake */
+/* radare2 - LGPL - Copyright 2009-2018 - pancake */
 
 #include "r_anal.h"
 #include "r_bin.h"
@@ -403,7 +403,7 @@ static int cmd_meta_comment(RCore *core, const char *input) {
 	case '+':
 	case ' ':
 		{
-		const char* newcomment = r_str_chop_ro (input + 2);
+		const char* newcomment = r_str_trim_ro (input + 2);
 		char *text, *comment = r_meta_get_string (core->anal, R_META_TYPE_COMMENT, addr);
 		char *nc = strdup (newcomment);
 		r_str_unescape (nc);
@@ -437,7 +437,7 @@ static int cmd_meta_comment(RCore *core, const char *input) {
 		const char *arg = input + 2;
 		while (*arg && *arg == ' ') arg++;
 		if (!strncmp (arg, "base64:", 7)) {
-			char *s = (char *)sdb_decode (arg+7, NULL);
+			char *s = (char *)sdb_decode (arg + 7, NULL);
 			if (s) {
 				newcomment = s;
 			} else {
@@ -669,7 +669,7 @@ static int cmd_meta_hsdmf(RCore *core, const char *input) {
 		}
 		while (repcnt < repeat) {
 			int off = (!input[1] || input[1] == ' ') ? 1 : 2;
-			t = strdup (r_str_chop_ro (input + off));
+			t = strdup (r_str_trim_ro (input + off));
 			p = NULL;
 			n = 0;
 			strncpy (name, t, sizeof (name) - 1);
@@ -684,13 +684,14 @@ static int cmd_meta_hsdmf(RCore *core, const char *input) {
 								eprintf ("Cannot resolve struct size\n");
 								n = 32; //
 							}
+p = t;
 						}
 						//make sure we do not overflow on r_print_format
 						if (n > core->blocksize) {
 							n = core->blocksize;
 						}
 						int r = r_print_format (core->print, addr, core->block,
-							n, p + 1, 0, NULL, NULL);
+							n, p, 0, NULL, NULL);
 						if (r < 0) {
 							n  = -1;
 						}
@@ -702,11 +703,11 @@ static int cmd_meta_hsdmf(RCore *core, const char *input) {
 					char tmp[256] = R_EMPTY;
 					int i, j, name_len = 0;
 					if (input[1] == 'a' || input[1] == '8') {
-						(void)r_core_read_at (core, addr, (ut8*)name, sizeof (name) - 1);
+						(void)r_io_read_at (core->io, addr, (ut8*)name, sizeof (name) - 1);
 						name[sizeof (name) - 1] = '\0';
 						name_len = strlen (name);
 					} else {
-						(void)r_core_read_at (core, addr, (ut8*)tmp, sizeof (tmp) - 3);
+						(void)r_io_read_at (core->io, addr, (ut8*)tmp, sizeof (tmp) - 3);
 						name_len = r_str_nlen_w (tmp, sizeof (tmp) - 3);
 						//handle wide strings
 						for (i = 0, j = 0; i < sizeof (name); i++, j++) {

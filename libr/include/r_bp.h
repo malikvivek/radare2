@@ -52,6 +52,7 @@ typedef struct r_bp_item_t {
 	int trace;
 	int internal; /* used for internal purposes */
 	int enabled;
+	int togglehits; /* counter that toggles breakpoint on reaching 0 */
 	int hits;
 	ut8 *obytes; /* original bytes */
 	ut8 *bbytes; /* breakpoint bytes */
@@ -113,12 +114,13 @@ R_API void r_bp_plugin_list(RBreakpoint *bp);
 R_API int r_bp_in(RBreakpoint *bp, ut64 addr, int rwx);
 // deprecate?
 R_API int r_bp_list(RBreakpoint *bp, int rad);
+R_API int r_bp_size(RBreakpoint *bp);
 
 /* bp item attribs setters */
 R_API int r_bp_get_bytes(RBreakpoint *bp, ut8 *buf, int len, int endian, int idx);
 R_API int r_bp_set_trace(RBreakpoint *bp, ut64 addr, int set);
 R_API int r_bp_set_trace_all(RBreakpoint *bp, int set);
-R_API RBreakpointItem *r_bp_enable(RBreakpoint *bp, ut64 addr, int set);
+R_API RBreakpointItem *r_bp_enable(RBreakpoint *bp, ut64 addr, int set, int count);
 R_API int r_bp_enable_all(RBreakpoint *bp, int set);
 
 /* index api */
